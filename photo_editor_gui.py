@@ -151,6 +151,14 @@ class MainWindow(QMainWindow):
         self.default_preset = {
             "do_instagram_compression": True,
             "resolution_percentage": 100,
+            "crop_aspect_ratio": "Free",
+            "crop_size": 100,
+            "crop_center_x": 50,
+            "crop_center_y": 50,
+            "crop_free_width": 100,
+            "crop_free_height": 100,
+            "add_white_border": False,
+            "white_border_width_pct": 5,
             "apply_temperature_adjustment": True,
             "values_multiplier": 1.0, "color_multiplier": 1.0, "color_adjustments_multiplier": 1.0,
             "hdr_compression": 0.0, "exposure": 0.0, "temp_kelvin": 6500, "tint": 0.0,
@@ -316,8 +324,31 @@ class MainWindow(QMainWindow):
         self.lbl_live_target_res = QLabel("Target Export Res: -")
         self.lbl_live_target_res.setStyleSheet("font-weight: bold; color: #a2a2a2;")
         vbox_p.addWidget(self.lbl_live_target_res)
-
         self.sliders_layout.addWidget(g_preset)
+
+        # --- Group Crop & Framing Elements ---
+        g_crop = QGroupBox("Crop & Border Configuration")
+        vbox_cb = QVBoxLayout(g_crop)
+        
+        self.crop_ratio_combo = QComboBox()
+        self.crop_ratio_combo.addItems(["Free", "Original", "1:1", "4:5", "5:7", "8:10", "16:9"])
+        self.crop_ratio_combo.currentTextChanged.connect(lambda txt: self._update_preset_key("crop_aspect_ratio", txt))
+        vbox_cb.addWidget(QLabel("Aspect Ratio Lock Selection:"))
+        vbox_cb.addWidget(self.crop_ratio_combo)
+
+        self.sliders_map["crop_size"] = self._create_slider_row(vbox_cb, "Crop Box Size (%)", 10, 100, 100, lambda v: self._update_preset_key("crop_size", v))
+        self.sliders_map["crop_free_width"] = self._create_slider_row(vbox_cb, "Crop Free Width (%)", 10, 100, 100, lambda v: self._update_preset_key("crop_free_width", v))
+        self.sliders_map["crop_free_height"] = self._create_slider_row(vbox_cb, "Crop Free Height (%)", 10, 100, 100, lambda v: self._update_preset_key("crop_free_height", v))
+        self.sliders_map["crop_center_x"] = self._create_slider_row(vbox_cb, "Crop Center X (%)", 0, 100, 50, lambda v: self._update_preset_key("crop_center_x", v))
+        self.sliders_map["crop_center_y"] = self._create_slider_row(vbox_cb, "Crop Center Y (%)", 0, 100, 50, lambda v: self._update_preset_key("crop_center_y", v))
+        
+        vbox_cb.addSpacing(10)
+        self.cb_white_border = QCheckBox("Apply Clean White Print Frame")
+        self.cb_white_border.toggled.connect(lambda state: self._update_preset_key("add_white_border", state))
+        vbox_cb.addWidget(self.cb_white_border)
+        
+        self.sliders_map["white_border_width_pct"] = self._create_slider_row(vbox_cb, "Border Frame Width (%)", 1, 20, 5, lambda v: self._update_preset_key("white_border_width_pct", v))
+        self.sliders_layout.addWidget(g_crop)
 
         # --- Group Macro Multipliers ---
         g_mult = QGroupBox("Macro Parameter Group Multipliers")
@@ -485,7 +516,16 @@ class MainWindow(QMainWindow):
         self.cb_instagram.setChecked(self.preset.get("do_instagram_compression", True))
         self.cb_apply_temp.setChecked(self.preset.get("apply_temperature_adjustment", True))
 
+        self.crop_ratio_combo.setCurrentText(self.preset.get("crop_aspect_ratio", "Free"))
+        self.cb_white_border.setChecked(self.preset.get("add_white_border", False))
+
         self.sliders_map["resolution_percentage"].setValue(int(self.preset.get("resolution_percentage", 100)))
+        self.sliders_map["crop_size"].setValue(int(self.preset.get("crop_size", 100)))
+        self.sliders_map["crop_free_width"].setValue(int(self.preset.get("crop_free_width", 100)))
+        self.sliders_map["crop_free_height"].setValue(int(self.preset.get("crop_free_height", 100)))
+        self.sliders_map["crop_center_x"].setValue(int(self.preset.get("crop_center_x", 50)))
+        self.sliders_map["crop_center_y"].setValue(int(self.preset.get("crop_center_y", 50)))
+        self.sliders_map["white_border_width_pct"].setValue(int(self.preset.get("white_border_width_pct", 5)))
 
         self.sliders_map["values_multiplier"].setValue(int(self.preset.get("values_multiplier", 1.0) * 100))
         self.sliders_map["color_multiplier"].setValue(int(self.preset.get("color_multiplier", 1.0) * 100))
@@ -527,12 +567,42 @@ class MainWindow(QMainWindow):
         if self.preset.get("do_instagram_compression", True):
             if w > 1080:
                 aspect = h / w
-                self.lbl_live_target_res.setText(f"Target Export Res: 1080 x {int(1080 * aspect)} (Instagram Scale)")
-            else:
-                self.lbl_live_target_res.setText(f"Target Export Res: {w} x {h} (Native Bounds)")
+                w, h = 1080, int(1080 * aspect)
         else:
             pct = self.preset.get("resolution_percentage", 100) / 100.0
-            self.lbl_live_target_res.setText(f"Target Export Res: {int(w * pct)} x {int(h * pct)} ({int(pct * 100)}%)")
+            w, h = int(w * pct), int(h * pct)
+            
+        ratio_mode = self.preset.get("crop_aspect_ratio", "Free")
+        if ratio_mode == "Free":
+            box_w = int(max(10, min(100, self.preset.get("crop_free_width", 100))) / 100.0 * w)
+            box_h = int(max(10, min(100, self.preset.get("crop_free_height", 100))) / 100.0 * h)
+        else:
+            if ratio_mode == "Original": target_ratio = w / h
+            elif ratio_mode == "1:1": target_ratio = 1.0
+            elif ratio_mode == "4:5": target_ratio = 5.0 / 4.0 if w >= h else 4.0 / 5.0
+            elif ratio_mode == "5:7": target_ratio = 7.0 / 5.0 if w >= h else 5.0 / 7.0
+            elif ratio_mode == "8:10": target_ratio = 10.0 / 8.0 if w >= h else 8.0 / 10.0
+            elif ratio_mode == "16:9": target_ratio = 16.0 / 9.0 if w >= h else 9.0 / 16.0
+            else: target_ratio = w / h
+                
+            if w / h >= target_ratio:
+                max_h = h
+                max_w = int(h * target_ratio)
+            else:
+                max_w = w
+                max_h = int(w / target_ratio)
+                
+            size_scale = max(10, min(100, self.preset.get("crop_size", 100))) / 100.0
+            box_w = int(max_w * size_scale)
+            box_h = int(max_h * size_scale)
+            
+        if self.preset.get("add_white_border", False):
+            border_pct = self.preset.get("white_border_width_pct", 5)
+            border_pixels = int(max(box_w, box_h) * (border_pct / 100.0))
+            box_w += 2 * border_pixels
+            box_h += 2 * border_pixels
+            
+        self.lbl_live_target_res.setText(f"Target Export Res: {box_w} x {box_h}")
 
     def _save_current_edits_to_session_cache(self):
         if not self.current_file_path: 
@@ -548,8 +618,7 @@ class MainWindow(QMainWindow):
     def _update_preset_key(self, key: str, value: Any):
         self.preset[key] = value
         if not self.is_updating_ui:
-            if key in ["resolution_percentage", "do_instagram_compression"]:
-                self._update_target_resolution_label()
+            self._update_target_resolution_label()
             self._save_current_edits_to_session_cache()
             self._refresh_viewport()
 
@@ -636,7 +705,6 @@ class MainWindow(QMainWindow):
                 self.preset = json.loads(json.dumps(self.default_preset))
 
             self._apply_preset_to_ui()
-            
             self._save_browsing_directory_state(os.path.dirname(path))
             self.statusBar().showMessage(f"Active workspace file: {os.path.basename(path)}")
         except Exception as e:
@@ -656,6 +724,8 @@ class MainWindow(QMainWindow):
             render_array = self.preview_matrix
         else:
             render_array = PhotoEditor.run_pipeline(self.preview_matrix, self.preset)
+            render_array = PhotoEditor.apply_crop(render_array, self.preset)
+            render_array = PhotoEditor.apply_white_border(render_array, self.preset)
 
         self.histogram_widget.render_histogram(render_array)
 

@@ -1,7 +1,7 @@
 """A headless photo editing utility mimicking basic Adobe Lightroom functionality.
 
 High-performance variation implementing a padded-stripe multi-threaded rendering
-pipeline with isolated grain execution deferred exclusively to export stages.
+pipeline with isolated grain, orientation-aware aspect crops, and white print borders.
 """
 
 import argparse
@@ -133,6 +133,7 @@ class PhotoEditor:
                 del hl_mask
 
             if shadows != 0.0:
+                sh_mask = np.power(np.float32(1.0) - Skinner, 2)
                 sh_mask = np.power(np.float32(1.0) - luminance, 2)
                 img += (np.float32(shadows) * sh_mask * img * np.float32(0.5))
                 del sh_mask
@@ -260,15 +261,93 @@ class PhotoEditor:
 
         return output_matrix
 
+    @staticmethod
+    def apply_crop(img: np.ndarray, preset: Dict[str, Any]) -> np.ndarray:
+        """Crops the floating-point matrix using preset geometry settings."""
+        h, w, _ = img.shape
+        ratio_mode = preset.get("crop_aspect_ratio", "Free")
+        
+        if ratio_mode == "Free":
+            box_w = int(max(10, min(100, preset.get("crop_free_width", 100))) / 100.0 * w)
+            box_h = int(max(10, min(100, preset.get("crop_free_height", 100))) / 100.0 * h)
+        else:
+            if ratio_mode == "Original":
+                target_ratio = w / h
+            elif ratio_mode == "1:1":
+                target_ratio = 1.0
+            elif ratio_mode == "4:5":
+                target_ratio = 5.0 / 4.0 if w >= h else 4.0 / 5.0
+            elif ratio_mode == "5:7":
+                target_ratio = 7.0 / 5.0 if w >= h else 5.0 / 7.0
+            elif ratio_mode == "8:10":
+                target_ratio = 10.0 / 8.0 if w >= h else 8.0 / 10.0
+            elif ratio_mode == "16:9":
+                target_ratio = 16.0 / 9.0 if w >= h else 9.0 / 16.0
+            else:
+                target_ratio = w / h
+                
+            if w / h >= target_ratio:
+                max_h = h
+                max_w = int(h * target_ratio)
+            else:
+                max_w = w
+                max_h = int(w / target_ratio)
+                
+            size_scale = max(10, min(100, preset.get("crop_size", 100))) / 100.0
+            box_w = int(max_w * size_scale)
+            box_h = int(max_h * size_scale)
+            
+        cx_pct = preset.get("crop_center_x", 50) / 100.0
+        cy_pct = preset.get("crop_center_y", 50) / 100.0
+        
+        ideal_cx = int(cx_pct * w)
+        ideal_cy = int(cy_pct * h)
+        
+        x_min = ideal_cx - box_w // 2
+        y_min = ideal_cy - box_h // 2
+        
+        if x_min < 0: x_min = 0
+        if x_min + box_w > w: x_min = w - box_w
+        if y_min < 0: y_min = 0
+        if y_min + box_h > h: y_min = h - box_h
+            
+        x_max = x_min + box_w
+        y_max = y_min + box_h
+        
+        x_min = max(0, min(w - 1, x_min))
+        x_max = max(x_min + 1, min(w, x_max))
+        y_min = max(0, min(h - 1, y_min))
+        y_max = max(y_min + 1, min(h, y_max))
+        
+        return img[y_min:y_max, x_min:x_max, :]
+
+    @staticmethod
+    def apply_white_border(img: np.ndarray, preset: Dict[str, Any]) -> np.ndarray:
+        """Appends a pure white border canvas footprint proportional to the frame size."""
+        if not preset.get("add_white_border", False):
+            return img
+        h, w, _ = img.shape
+        border_pct = preset.get("white_border_width_pct", 5)
+        border_pixels = int(max(w, h) * (border_pct / 100.0))
+        if border_pixels > 0:
+            return cv2.copyMakeBorder(
+                img, border_pixels, border_pixels, border_pixels, border_pixels,
+                cv2.BORDER_CONSTANT, value=[1.0, 1.0, 1.0]
+            )
+        return img
+
     def apply_presets(self, preset: Dict[str, Any]) -> np.ndarray:
         return self.run_parallel_pipeline(self.original_image, preset)
 
 
 def export_photo(img_array: np.ndarray, output_path: str, preset: Dict[str, Any], max_mb: float = 8.0):
-    """Converts floats to uint8 profiles and runs high-precision grain noise generation during file writes."""
-    final_img_array = (np.clip(img_array, 0.0, 1.0) * 255.0).astype(np.uint8)
+    """Converts frames, applies crop structures, maps film grain, and appends print border vectors."""
+    # 1. Apply non-destructive crop transformations first
+    img_cropped = PhotoEditor.apply_crop(img_array, preset)
     
-    # Grain noise generation runs exclusively here to save UI processing threads
+    final_img_array = (np.clip(img_cropped, 0.0, 1.0) * 255.0).astype(np.uint8)
+    
+    # 2. Add film noise onto the cropped image context
     grain = preset.get("grain", 0.0)
     grain_size = preset.get("grain_size", 1.0)
     if grain > 0.0:
@@ -279,6 +358,17 @@ def export_photo(img_array: np.ndarray, output_path: str, preset: Dict[str, Any]
         if g_size != 1.0:
             noise = cv2.resize(noise, (fw, fh), interpolation=cv2.INTER_LINEAR)
         final_img_array = np.clip(final_img_array.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+
+    # 3. Append white borders at the absolute end to isolate grain noise
+    if preset.get("add_white_border", False):
+        fh, fw, fc = final_img_array.shape
+        border_pct = preset.get("white_border_width_pct", 5)
+        border_pixels = int(max(fw, fh) * (border_pct / 100.0))
+        if border_pixels > 0:
+            final_img_array = cv2.copyMakeBorder(
+                final_img_array, border_pixels, border_pixels, border_pixels, border_pixels,
+                cv2.BORDER_CONSTANT, value=[255, 255, 255]
+            )
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     img_pil = Image.fromarray(final_img_array)
@@ -294,7 +384,6 @@ def export_photo(img_array: np.ndarray, output_path: str, preset: Dict[str, Any]
             quality -= 5
     else:
         img_pil.save(output_path, format="JPEG", quality=92)
-
 
 def playbook_single_file(file_path: str, output_dir: str, preset_data: Dict[str, Any]):
     _, input_filename = os.path.split(file_path)
