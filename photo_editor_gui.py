@@ -13,17 +13,18 @@ import configparser
 from typing import Dict, Any
 import cv2
 import numpy as np
+import rawpy
 
-from PyQt6.QtCore import Qt, QDir, QThread, pyqtSignal
-from PyQt6.QtGui import QImage, QPixmap, QAction, QKeySequence, QFileSystemModel, QPainter, QKeyEvent
+from PyQt6.QtCore import Qt, QDir, QThread, pyqtSignal, QTimer, QEvent, QModelIndex
+from PyQt6.QtGui import QImage, QPixmap, QAction, QKeySequence, QFileSystemModel, QPainter, QKeyEvent, QCursor
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QSplitter, QTreeView, QGraphicsView, QGraphicsScene, QPushButton,
     QSlider, QCheckBox, QComboBox, QLabel, QGroupBox, QScrollArea, QFileDialog,
-    QFrame, QLineEdit
+    QFrame, QLineEdit, QMenu
 )
 
-from photo_editor_core import PhotoEditor, export_photo, SUPPORTED_EXTENSIONS
+from photo_editor_core import PhotoEditor, export_photo, SUPPORTED_EXTENSIONS, RAW_EXTENSIONS
 
 
 class ExportWorker(QThread):
@@ -32,16 +33,19 @@ class ExportWorker(QThread):
     progress_signal = pyqtSignal(str)
     finished_signal = pyqtSignal(bool, str)
 
-    def __init__(self, src_matrix: np.ndarray, preset: Dict[str, Any], output_path: str):
+    def __init__(self, image_path: str, preset: Dict[str, Any], output_path: str):
         super().__init__()
-        self.src_matrix = np.copy(src_matrix)
+        self.image_path = image_path
         self.preset = json.loads(json.dumps(preset))
         self.output_path = output_path
 
     def run(self):
         try:
+            self.progress_signal.emit("Loading full resolution raw asset matrix...")
+            full_res = PhotoEditor.load_image_matrix(self.image_path, preview=False)
+
             self.progress_signal.emit("Executing multi-core pipeline calculation pass...")
-            processed_full = PhotoEditor.run_parallel_pipeline(self.src_matrix, self.preset)
+            processed_full = PhotoEditor.run_parallel_pipeline(full_res, self.preset)
 
             self.progress_signal.emit("Writing compressed photo file to disk layout...")
             export_photo(processed_full, self.output_path, self.preset)
@@ -49,6 +53,31 @@ class ExportWorker(QThread):
             self.finished_signal.emit(True, f"Successfully exported: {os.path.basename(self.output_path)}")
         except Exception as e:
             self.finished_signal.emit(False, f"Export engine failed: {str(e)}")
+
+
+class CustomFileSystemModel(QFileSystemModel):
+    """Extended file model inserting contextual status markers dynamically inside listings."""
+    
+    def __init__(self, main_window, parent=None):
+        super().__init__(parent)
+        self.main_window = main_window
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole):
+        if role == Qt.ItemDataRole.DisplayRole and index.column() == 0:
+            path = self.filePath(index)
+            base_string = super().data(index, role)
+            if not base_string:
+                return base_string
+
+            prefix = ""
+            suffix = ""
+            if path in self.main_window.starred_files:
+                prefix += "⭐ "
+            if path in self.main_window.exported_files:
+                suffix += " 💾"
+
+            return f"{prefix}{base_string}{suffix}"
+        return super().data(index, role)
 
 
 class HistogramWidget(QFrame):
@@ -121,11 +150,11 @@ class CollapsibleGroupBox(QGroupBox):
         self.box_layout.setContentsMargins(6, 8, 6, 6)
         self.box_layout.setSpacing(4)
 
-        self.toggle_btn = QPushButton("v")
+        self.toggle_btn = QPushButton("▼ Collapse Panel Layer")
         self.toggle_btn.setCheckable(True)
         self.toggle_btn.setChecked(False)
         self.toggle_btn.setStyleSheet(
-            "QPushButton { text-align: left; padding: 4px; "
+            "QPushButton { text-align: left; font-weight: bold; padding: 4px; "
             "border: 1px solid #444; background-color: #353535; color: #eee; border-radius: 3px; }"
             "QPushButton:checked { background-color: #252525; color: #999; }"
         )
@@ -142,10 +171,10 @@ class CollapsibleGroupBox(QGroupBox):
     def _on_toggle_triggered(self, checked: bool):
         if checked:
             self.content_widget.hide()
-            self.toggle_btn.setText(">")
+            self.toggle_btn.setText("▶ Expand Panel Layer")
         else:
             self.content_widget.show()
-            self.toggle_btn.setText("v")
+            self.toggle_btn.setText("▼ Collapse Panel Layer")
 
 
 class ZoomableGraphicsView(QGraphicsView):
@@ -174,20 +203,27 @@ class MainWindow(QMainWindow):
         self.resize(1500, 900)
 
         self.current_file_path = ""
-        self.full_res_matrix = None
         self.preview_matrix = None
         self.show_original_state = False
         self.is_updating_ui = False
         self.export_thread = None
+        self.copied_settings_buffer = None
 
         self.cache_directory = os.path.join(tempfile.gettempdir(), "photo_editor_session_cache")
         os.makedirs(self.cache_directory, exist_ok=True)
         self.state_ini_path = os.path.join(self.cache_directory, "session_state.ini")
+        self.registry_json_path = os.path.join(self.cache_directory, "file_status_registry.json")
+
+        # Load persisted status markers 
+        self.starred_files = set()
+        self.exported_files = set()
+        self._load_file_status_registry()
 
         self.default_preset = {
             "do_instagram_compression": True,
             "resolution_percentage": 100,
             "crop_aspect_ratio": "Free",
+            "crop_rotation": 0,
             "crop_size": 100,
             "crop_center_x": 50,
             "crop_center_y": 50,
@@ -197,9 +233,11 @@ class MainWindow(QMainWindow):
             "white_border_width_pct": 5,
             "apply_temperature_adjustment": True,
             "values_multiplier": 1.0, "color_multiplier": 1.0, "color_adjustments_multiplier": 1.0,
-            "hdr_compression": 0.0, "exposure": 0.0, "temp_kelvin": 6500, "tint": 0.0,
-            "contrast": 0.0, "highlights": 0.0, "shadows": 0.0, "texture": 0.0, "clarity": 0.0,
+            "hdr_compression": 0.0, "exposure": 0.0, "contrast": 0.0,
+            "whites": 0.0, "blacks": 0.0, # Added value parameters
+            "highlights": 0.0, "shadows": 0.0, "texture": 0.0, "clarity": 0.0,
             "gaussian_blur": 0.0, "vibrance": 0.0, "saturation": 0.0, "grain": 0.0, "grain_size": 1.0,
+            "temp_kelvin": 6500, "tint": 0.0,
             "color_adjustments": {
                 "red": {"hue": 0.0, "sat": 0.0}, "orange": {"hue": 0.0, "sat": 0.0},
                 "yellow": {"hue": 0.0, "sat": 0.0}, "green": {"hue": 0.0, "sat": 0.0}, "blue": {"hue": 0.0, "sat": 0.0}
@@ -211,6 +249,19 @@ class MainWindow(QMainWindow):
         self._init_menu_bar()
         self._init_ui_layout()
         self._populate_local_presets()
+        
+        self.hover_preview = QLabel(None, Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+        self.hover_preview.setStyleSheet("border: 1px solid #666; background-color: #1a1a1a;")
+        self.hover_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.hover_preview.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.hover_preview.hide()
+
+        self.hover_timer = QTimer(self)
+        self.hover_timer.setSingleShot(True)
+        self.hover_timer.timeout.connect(self._show_hover_preview)
+        self.hover_target_path = ""
+
+        self.showMaximized()
 
     def _init_menu_bar(self):
         menu_bar = self.menuBar()
@@ -241,10 +292,43 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.export_action)
 
         tools_menu = menu_bar.addMenu("&Tools")
+        
+        copy_settings_action = QAction("&Copy Settings", self)
+        copy_settings_action.setShortcut(QKeySequence("Ctrl+C"))
+        copy_settings_action.triggered.connect(self._copy_edit_settings)
+        tools_menu.addAction(copy_settings_action)
+
+        paste_settings_action = QAction("&Paste Settings", self)
+        paste_settings_action.setShortcut(QKeySequence("Ctrl+V"))
+        paste_settings_action.triggered.connect(self._paste_edit_settings)
+        tools_menu.addAction(paste_settings_action)
+
+        tools_menu.addSeparator()
+
         self.highlight_clipped_action = QAction("&Highlight Clipped Pixels", self)
         self.highlight_clipped_action.setCheckable(True)
         self.highlight_clipped_action.triggered.connect(self._refresh_viewport)
         tools_menu.addAction(self.highlight_clipped_action)
+
+    def _load_file_status_registry(self):
+        if os.path.exists(self.registry_json_path):
+            try:
+                with open(self.registry_json_path, "r") as f:
+                    data = json.load(f)
+                    self.starred_files = set(data.get("starred_paths", []))
+                    self.exported_files = set(data.get("exported_paths", []))
+            except Exception:
+                pass
+
+    def _save_file_status_registry(self):
+        try:
+            with open(self.registry_json_path, "w") as f:
+                json.dump({
+                    "starred_paths": list(self.starred_files),
+                    "exported_paths": list(self.exported_files)
+                }, f, indent=2)
+        except Exception:
+            pass
 
     def _get_initial_browsing_directory(self) -> str:
         config = configparser.ConfigParser()
@@ -267,6 +351,30 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _copy_edit_settings(self):
+        focused = self.focusWidget()
+        if isinstance(focused, QLineEdit):
+            focused.copy()
+            return
+            
+        self.copied_settings_buffer = json.loads(json.dumps(self.preset))
+        self.statusBar().showMessage("Preset configurations copied to memory cache buffer.")
+
+    def _paste_edit_settings(self):
+        focused = self.focusWidget()
+        if isinstance(focused, QLineEdit):
+            focused.paste()
+            return
+            
+        if self.copied_settings_buffer is None:
+            self.statusBar().showMessage("Paste blocked: Memory configuration clipboard is completely empty.")
+            return
+            
+        self.preset = json.loads(json.dumps(self.copied_settings_buffer))
+        self._apply_preset_to_ui()
+        self._save_current_edits_to_session_cache()
+        self.statusBar().showMessage("Preset configurations injected onto active workspace matrix.")
+
     def _init_ui_layout(self):
         main_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.setCentralWidget(main_splitter)
@@ -274,7 +382,8 @@ class MainWindow(QMainWindow):
         # ------------------ PANEL LEFT: FILE TREE & METADATA ------------------
         left_splitter = QSplitter(Qt.Orientation.Vertical)
 
-        self.file_model = QFileSystemModel()
+        # Connected back to the CustomFileSystemModel subclass architecture
+        self.file_model = CustomFileSystemModel(self)
         self.file_model.setRootPath(QDir.rootPath())
         self.file_model.setNameFilters([f"*{ext}" for ext in SUPPORTED_EXTENSIONS])
         self.file_model.setNameFilterDisables(False)
@@ -288,6 +397,15 @@ class MainWindow(QMainWindow):
         self.tree_view.setColumnHidden(2, True)
         self.tree_view.setColumnHidden(3, True)
         self.tree_view.clicked.connect(self._on_file_selected)
+        
+        # Rig context actions 
+        self.tree_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree_view.customContextMenuRequested.connect(self._show_tree_context_menu)
+        
+        self.tree_view.setMouseTracking(True)
+        self.tree_view.entered.connect(self._on_tree_view_entered)
+        self.tree_view.viewport().installEventFilter(self)
+        
         left_splitter.addWidget(self.tree_view)
 
         self.info_panel = QGroupBox("Active Metadata Profiles")
@@ -340,6 +458,79 @@ class MainWindow(QMainWindow):
         main_splitter.addWidget(scroll_area)
         main_splitter.setSizes([280, 850, 370])
 
+    def eventFilter(self, source, event):
+        if source == self.tree_view.viewport() and event.type() == QEvent.Type.Leave:
+            self.hover_timer.stop()
+            self.hover_preview.hide()
+        return super().eventFilter(source, event)
+
+    def _on_tree_view_entered(self, index):
+        self.hover_timer.stop()
+        path = self.file_model.filePath(index)
+        if os.path.isdir(path) or os.path.splitext(path)[1].lower() not in SUPPORTED_EXTENSIONS:
+            self.hover_preview.hide()
+            return
+            
+        self.hover_target_path = path
+        self.hover_timer.start(300)
+
+    def _show_hover_preview(self):
+        if not self.hover_target_path or not os.path.exists(self.hover_target_path):
+            return
+            
+        try:
+            ext = os.path.splitext(self.hover_target_path)[1].lower()
+            if ext in RAW_EXTENSIONS:
+                with rawpy.imread(self.hover_target_path) as raw:
+                    rgb = raw.postprocess(use_camera_wb=True, half_size=True, no_auto_bright=True, output_bps=8)
+                    h, w, _ = rgb.shape
+                    scale = 320.0 / w
+                    img_small = cv2.resize(rgb, (320, int(h * scale)), interpolation=cv2.INTER_AREA)
+            else:
+                with Image.open(self.hover_target_path) as img:
+                    img.thumbnail((320, 320))
+                    img_small = np.array(img.convert("RGB"))
+                    
+            sh, sw, sc = img_small.shape
+            q_img = QImage(img_small.data, sw, sh, sc * sw, QImage.Format.Format_RGB888)
+            pixmap = QPixmap.fromImage(q_img)
+            
+            self.hover_preview.setPixmap(pixmap)
+            self.hover_preview.setFixedSize(sw + 4, sh + 4)
+            
+            cursor_pos = QCursor.pos()
+            self.hover_preview.move(cursor_pos.x() + 25, cursor_pos.y() + 12)
+            self.hover_preview.show()
+        except Exception:
+            self.hover_preview.hide()
+
+    def _show_tree_context_menu(self, position):
+        index = self.tree_view.indexAt(position)
+        if not index.isValid():
+            return
+            
+        path = self.file_model.filePath(index)
+        if os.path.isdir(path):
+            return
+
+        context_menu = QMenu(self)
+        is_starred = path in self.starred_files
+        
+        star_action = QAction("Remove Star" if is_starred else "Star Photo ⭐", self)
+        star_action.triggered.connect(lambda: self._toggle_file_star(path))
+        context_menu.addAction(star_action)
+        
+        context_menu.exec(self.tree_view.viewport().mapToGlobal(position))
+
+    def _toggle_file_star(self, path: str):
+        if path in self.starred_files:
+            self.starred_files.remove(path)
+        else:
+            self.starred_files.add(path)
+            
+        self._save_file_status_registry()
+        self.file_model.layoutChanged.emit()
+
     def _build_sliders_interface(self):
         """Assembles interactive group layers strictly mapped to structural criteria."""
         
@@ -371,6 +562,7 @@ class MainWindow(QMainWindow):
         g_crop.content_layout.addWidget(QLabel("Aspect Ratio Lock Selection:"))
         g_crop.content_layout.addWidget(self.crop_ratio_combo)
 
+        self.sliders_map["crop_rotation"] = self._create_slider_row(g_crop.content_layout, "Crop Rotation (°)", -45, 45, 0, lambda v: self._update_preset_key("crop_rotation", v))
         self.sliders_map["crop_size"] = self._create_slider_row(g_crop.content_layout, "Crop Box Size (%)", 10, 100, 100, lambda v: self._update_preset_key("crop_size", v))
         self.sliders_map["crop_free_width"] = self._create_slider_row(g_crop.content_layout, "Crop Free Width (%)", 10, 100, 100, lambda v: self._update_preset_key("crop_free_width", v))
         self.sliders_map["crop_free_height"] = self._create_slider_row(g_crop.content_layout, "Crop Free Height (%)", 10, 100, 100, lambda v: self._update_preset_key("crop_free_height", v))
@@ -390,6 +582,11 @@ class MainWindow(QMainWindow):
         self.sliders_map["values_multiplier"] = self._create_slider_row(g_val.content_layout, "Values Shift Multiplier", 0, 100, 100, lambda v: self._update_preset_key("values_multiplier", v / 100.0))
         self.sliders_map["exposure"] = self._create_slider_row(g_val.content_layout, "Exposure (Stops)", -200, 200, 0, lambda v: self._update_preset_key("exposure", v / 100.0))
         self.sliders_map["contrast"] = self._create_slider_row(g_val.content_layout, "Contrast", -100, 100, 0, lambda v: self._update_preset_key("contrast", v / 100.0))
+        
+        # Added Whites and Blacks UI settings slider elements
+        self.sliders_map["whites"] = self._create_slider_row(g_val.content_layout, "Whites", -100, 100, 0, lambda v: self._update_preset_key("whites", v / 100.0))
+        self.sliders_map["blacks"] = self._create_slider_row(g_val.content_layout, "Blacks", -100, 100, 0, lambda v: self._update_preset_key("blacks", v / 100.0))
+        
         self.sliders_map["highlights"] = self._create_slider_row(g_val.content_layout, "Highlights Recovery", -100, 100, 0, lambda v: self._update_preset_key("highlights", v / 100.0))
         self.sliders_map["shadows"] = self._create_slider_row(g_val.content_layout, "Shadows Optimization", -100, 100, 0, lambda v: self._update_preset_key("shadows", v / 100.0))
         self.sliders_map["hdr_compression"] = self._create_slider_row(g_val.content_layout, "HDR Compression Curve", 0, 100, 0, lambda v: self._update_preset_key("hdr_compression", v / 100.0))
@@ -447,14 +644,16 @@ class MainWindow(QMainWindow):
         slider = QSlider(Qt.Orientation.Horizontal)
         slider.setRange(mn, mx)
         slider.setValue(init)
+        
+        slider.wheelEvent = lambda event: event.ignore()
 
         value_edit = QLineEdit(str(init))
         value_edit.setFixedWidth(50)
         value_edit.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         def on_slider_changed(val):
+            value_edit.setText(str(val))
             if not self.is_updating_ui:
-                value_edit.setText(str(val))
                 callback(val)
 
         def on_text_confirmed():
@@ -544,6 +743,7 @@ class MainWindow(QMainWindow):
         self.cb_white_border.setChecked(self.preset.get("add_white_border", False))
 
         self.sliders_map["resolution_percentage"].setValue(int(self.preset.get("resolution_percentage", 100)))
+        self.sliders_map["crop_rotation"].setValue(int(self.preset.get("crop_rotation", 0)))
         self.sliders_map["crop_size"].setValue(int(self.preset.get("crop_size", 100)))
         self.sliders_map["crop_free_width"].setValue(int(self.preset.get("crop_free_width", 100)))
         self.sliders_map["crop_free_height"].setValue(int(self.preset.get("crop_free_height", 100)))
@@ -555,13 +755,16 @@ class MainWindow(QMainWindow):
         self.sliders_map["color_multiplier"].setValue(int(self.preset.get("color_multiplier", 1.0) * 100))
         self.sliders_map["color_adjustments_multiplier"].setValue(int(self.preset.get("color_adjustments_multiplier", 1.0) * 100))
 
-        self.sliders_map["temp_kelvin"].setValue(int(self.preset.get("temp_kelvin", 6500)))
-        self.sliders_map["tint"].setValue(int(self.preset.get("tint", 0.0) * 100))
-        self.sliders_map["hdr_compression"].setValue(int(self.preset.get("hdr_compression", 0.0) * 100))
         self.sliders_map["exposure"].setValue(int(self.preset.get("exposure", 0.0) * 100))
         self.sliders_map["contrast"].setValue(int(self.preset.get("contrast", 0.0) * 100))
+        self.sliders_map["whites"].setValue(int(self.preset.get("whites", 0.0) * 100))
+        self.sliders_map["blacks"].setValue(int(self.preset.get("blacks", 0.0) * 100))
         self.sliders_map["highlights"].setValue(int(self.preset.get("highlights", 0.0) * 100))
         self.sliders_map["shadows"].setValue(int(self.preset.get("shadows", 0.0) * 100))
+        self.sliders_map["hdr_compression"].setValue(int(self.preset.get("hdr_compression", 0.0) * 100))
+
+        self.sliders_map["temp_kelvin"].setValue(int(self.preset.get("temp_kelvin", 6500)))
+        self.sliders_map["tint"].setValue(int(self.preset.get("tint", 0.0) * 100))
 
         self.sliders_map["texture"].setValue(int(self.preset.get("texture", 0.0) * 100))
         self.sliders_map["clarity"].setValue(int(self.preset.get("clarity", 0.0) * 100))
@@ -583,11 +786,22 @@ class MainWindow(QMainWindow):
         self._refresh_viewport()
 
     def _update_target_resolution_label(self):
-        if self.full_res_matrix is None:
+        if not self.current_file_path:
             self.lbl_live_target_res.setText("Target Export Res: -")
             return
             
-        h, w, _ = self.full_res_matrix.shape
+        try:
+            ext = os.path.splitext(self.current_file_path)[1].lower()
+            if ext in RAW_EXTENSIONS:
+                with rawpy.imread(self.current_file_path) as raw:
+                    w, h = raw.sizes.width, raw.sizes.height
+            else:
+                with Image.open(self.current_file_path) as img:
+                    w, h = img.size
+        except Exception:
+            self.lbl_live_target_res.setText("Target Export Res: -")
+            return
+            
         if self.preset.get("do_instagram_compression", True):
             if w > 1080:
                 aspect = h / w
@@ -687,15 +901,19 @@ class MainWindow(QMainWindow):
             return
 
         self.current_file_path = path
-        self.statusBar().showMessage(f"Loading image asset: {os.path.basename(path)}")
+        self.statusBar().showMessage(f"Loading image preview asset: {os.path.basename(path)}")
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
 
         try:
-            self.full_res_matrix = PhotoEditor.load_image_matrix(path)
-            h, w, _ = self.full_res_matrix.shape
-            
+            if ext in RAW_EXTENSIONS:
+                with rawpy.imread(path) as raw:
+                    orig_w, orig_h = raw.sizes.width, raw.sizes.height
+            else:
+                with Image.open(path) as img:
+                    orig_w, orig_h = img.size
+
             self.lbl_info_name.setText(f"Name: {os.path.basename(path)}")
-            self.lbl_info_res.setText(f"Original Resolution: {w} x {h}")
+            self.lbl_info_res.setText(f"Original Resolution: {orig_w} x {orig_h}")
             
             mtime = os.path.getmtime(path)
             date_str = datetime.datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')
@@ -704,12 +922,7 @@ class MainWindow(QMainWindow):
             size_mb = os.path.getsize(path) / (1024 * 1024)
             self.lbl_info_size.setText(f"File Disk Size: {size_mb:.2f} MB")
 
-            preview_width = 1200
-            if w > preview_width:
-                aspect = h / w
-                self.preview_matrix = cv2.resize(self.full_res_matrix, (preview_width, int(preview_width * aspect)), interpolation=cv2.INTER_AREA)
-            else:
-                self.preview_matrix = np.copy(self.full_res_matrix)
+            self.preview_matrix = PhotoEditor.load_image_matrix(path, preview=True)
 
             filename = os.path.basename(path)
             cache_target_path = os.path.join(self.cache_directory, f"{filename}.json")
@@ -746,7 +959,6 @@ class MainWindow(QMainWindow):
             render_array = PhotoEditor.run_pipeline(self.preview_matrix, self.preset)
             render_array = PhotoEditor.apply_crop(render_array, self.preset)
             
-            # Extract histogram and clip masks BEFORE appending the white border padding
             self.histogram_widget.render_histogram(render_array)
             img_uint8 = (np.clip(render_array, 0.0, 1.0) * 255.0).astype(np.uint8)
 
@@ -755,7 +967,6 @@ class MainWindow(QMainWindow):
                 mask_white = (img_uint8[:, :, 0] == 255) & (img_uint8[:, :, 1] == 255) & (img_uint8[:, :, 2] == 255)
                 img_uint8[mask_black | mask_white] = [255, 0, 0]
                 
-            # Render white border downscaling on the isolated UI matrix view frame
             img_uint8 = PhotoEditor.apply_white_border(img_uint8, self.preset)
 
         h, w, ch = img_uint8.shape
@@ -767,7 +978,7 @@ class MainWindow(QMainWindow):
         self.scene.setSceneRect(0, 0, w, h)
 
     def _trigger_file_export(self):
-        if self.full_res_matrix is None or not self.current_file_path:
+        if not self.current_file_path:
             self.statusBar().showMessage("Export failure: No active file target data mapping available.")
             return
 
@@ -788,7 +999,7 @@ class MainWindow(QMainWindow):
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         self.export_action.setEnabled(False)
 
-        self.export_thread = ExportWorker(self.full_res_matrix, self.preset, out_path)
+        self.export_thread = ExportWorker(self.current_file_path, self.preset, out_path)
         self.export_thread.progress_signal.connect(self.statusBar().showMessage)
         self.export_thread.finished_signal.connect(self._on_export_thread_completed)
         self.export_thread.start()
@@ -797,6 +1008,13 @@ class MainWindow(QMainWindow):
         QApplication.restoreOverrideCursor()
         self.export_action.setEnabled(True)
         self.statusBar().showMessage(message)
+        
+        # Append target key status values dynamically if calculation pipeline completes safely
+        if success and self.current_file_path:
+            self.exported_files.add(self.current_file_path)
+            self._save_file_status_registry()
+            self.file_model.layoutChanged.emit()
+
         if self.export_thread:
             self.export_thread.quit()
             self.export_thread.wait()

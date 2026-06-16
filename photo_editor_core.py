@@ -1,7 +1,7 @@
 """A headless photo editing utility mimicking basic Adobe Lightroom functionality.
 
 High-performance variation implementing a padded-stripe multi-threaded rendering
-pipeline with isolated grain, orientation-aware aspect crops, and dimension-preserving white borders.
+pipeline with isolated grain, center rotation skew fixes, and white print borders.
 """
 
 import argparse
@@ -18,8 +18,8 @@ import rawpy
 
 pillow_heif.register_heif_opener()
 
-IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".heic")
-RAW_EXTENSIONS = (".raf", ".cr2", ".nef", ".arw", ".dng")
+IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.heic')
+RAW_EXTENSIONS = ('.raf', '.cr2', '.nef', '.arw', '.dng')
 SUPPORTED_EXTENSIONS = IMAGE_EXTENSIONS + RAW_EXTENSIONS
 
 
@@ -31,24 +31,38 @@ class PhotoEditor:
         self.original_image = self.load_image_matrix(image_path)
         
     @staticmethod
-    def load_image_matrix(image_path: str) -> np.ndarray:
+    def load_image_matrix(image_path: str, preview: bool = False) -> np.ndarray:
+        """Loads image files into floating-point numpy structures with fast-preview overrides."""
         ext = os.path.splitext(image_path)[1].lower()
 
         if ext in RAW_EXTENSIONS:
             with rawpy.imread(image_path) as raw:
-                rgb_16 = raw.postprocess(
-                    use_camera_wb=True, 
-                    half_size=False, 
-                    no_auto_bright=True, 
-                    output_bps=16
-                )
-            return rgb_16.astype(np.float32) / 65535.0
+                if preview:
+                    rgb_8 = raw.postprocess(
+                        use_camera_wb=True,
+                        half_size=True,
+                        no_auto_bright=True,
+                        output_bps=8
+                    )
+                    return rgb_8.astype(np.float32) / 255.0
+                else:
+                    rgb_16 = raw.postprocess(
+                        use_camera_wb=True, 
+                        half_size=False, 
+                        no_auto_bright=True, 
+                        output_bps=16
+                    )
+                    return rgb_16.astype(np.float32) / 65535.0
         else:
             with Image.open(image_path) as img:
                 img = ImageOps.exif_transpose(img)
-                if img.mode != "RGB":
-                    img = img.convert("RGB")
-                return np.array(img, dtype=np.float32) / 255.0
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                matrix = np.array(img, dtype=np.float32) / 255.0
+                if preview and matrix.shape[1] > 1200:
+                    scale = 1200.0 / matrix.shape[1]
+                    matrix = cv2.resize(matrix, (1200, int(matrix.shape[0] * scale)), interpolation=cv2.INTER_AREA)
+                return matrix
 
     @staticmethod
     def _apply_aces_tonemap(img: np.ndarray, intensity: float) -> np.ndarray:
@@ -73,19 +87,19 @@ class PhotoEditor:
         """Executes core image filters sequentially using in-place operations."""
         img = np.copy(src_matrix).astype(np.float32)
 
-        v_mult = np.clip(preset.get("values_multiplier", 1.0), 0.0, 1.0)
-        c_mult = np.clip(preset.get("color_multiplier", 1.0), 0.0, 1.0)
-        ca_mult = np.clip(preset.get("color_adjustments_multiplier", 1.0), 0.0, 1.0)
+        v_mult = np.clip(preset.get('values_multiplier', 1.0), 0.0, 1.0)
+        c_mult = np.clip(preset.get('color_multiplier', 1.0), 0.0, 1.0)
+        ca_mult = np.clip(preset.get('color_adjustments_multiplier', 1.0), 0.0, 1.0)
 
         # 1. ACES Tonemapping
-        hdr_comp = preset.get("hdr_compression", 0.0)
+        hdr_comp = preset.get('hdr_compression', 0.0)
         if hdr_comp > 0.0:
             img = cls._apply_aces_tonemap(img, hdr_comp)
 
         # 2. White Balance
-        apply_temp = preset.get("apply_temperature_adjustment", True)
-        temp_kelvin = preset.get("temp_kelvin", 6500.0)
-        tint = preset.get("tint", 0.0)  
+        apply_temp = preset.get('apply_temperature_adjustment', True)
+        temp_kelvin = preset.get('temp_kelvin', 6500.0)
+        tint = preset.get('tint', 0.0)  
         
         if apply_temp and temp_kelvin != 6500.0:
             if temp_kelvin > 6500.0:
@@ -106,22 +120,33 @@ class PhotoEditor:
         np.clip(img, 0.0, 1.0, out=img)
 
         # 3. Exposure
-        exposure = preset.get("exposure", 0.0)
+        exposure = preset.get('exposure', 0.0)
         if exposure != 0.0:
             img *= np.float32(2.0 ** exposure)
             np.clip(img, 0.0, 1.0, out=img)
 
         # 4. Contrast
-        contrast = preset.get("contrast", 0.0) * v_mult
+        contrast = preset.get('contrast', 0.0) * v_mult
         if contrast != 0.0:
             img -= np.float32(0.5)
             img *= np.float32(1.0 + contrast)
             img += np.float32(0.5)
             np.clip(img, 0.0, 1.0, out=img)
 
-        # 5. Highlights and Shadows
-        highlights = preset.get("highlights", 0.0) * v_mult
-        shadows = preset.get("shadows", 0.0) * v_mult
+        # 5. Whites & Blacks (Dynamic Endpoint Remapping)
+        whites = preset.get('whites', 0.0) * v_mult
+        blacks = preset.get('blacks', 0.0) * v_mult
+        if whites != 0.0 or blacks != 0.0:
+            w_thr = 1.0 - (whites * 0.15)
+            b_thr = 0.0 - (blacks * 0.15)
+            if w_thr <= b_thr:
+                w_thr = b_thr + 0.01
+            img = (img - b_thr) / (w_thr - b_thr)
+            np.clip(img, 0.0, 1.0, out=img)
+
+        # 6. Highlights and Shadows
+        highlights = preset.get('highlights', 0.0) * v_mult
+        shadows = preset.get('shadows', 0.0) * v_mult
 
         if highlights != 0.0 or shadows != 0.0:
             luminance = np.float32(0.299) * img[:, :, 0] + np.float32(0.587) * img[:, :, 1] + np.float32(0.114) * img[:, :, 2]
@@ -140,14 +165,14 @@ class PhotoEditor:
             del luminance
             np.clip(img, 0.0, 1.0, out=img)
 
-        # 6. Texture and Clarity
-        texture = preset.get("texture", 0.0)
+        # 7. Texture and Clarity
+        texture = preset.get('texture', 0.0)
         if texture != 0.0:
             low_pass = cv2.GaussianBlur(img, (5, 5), 0)
             img += (np.float32(texture) * (img - low_pass) * np.float32(0.4))
             del low_pass
 
-        clarity = preset.get("clarity", 0.0)
+        clarity = preset.get('clarity', 0.0)
         if clarity != 0.0:
             h, w, _ = img.shape
             if w > 2200:
@@ -164,37 +189,37 @@ class PhotoEditor:
 
         np.clip(img, 0.0, 1.0, out=img)
 
-        # 7. Gaussian Blur
-        blur_radius = preset.get("gaussian_blur", 0.0)
+        # 8. Gaussian Blur
+        blur_radius = preset.get('gaussian_blur', 0.0)
         if blur_radius > 0:
             k_size = int(blur_radius * 4) | 1
             if k_size > 1:
                 img = cv2.GaussianBlur(img, (k_size, k_size), 0)
 
-        # 8. High-Precision Color Engine
+        # 9. High-Precision Color Engine
         hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
 
-        vibrance = preset.get("vibrance", 0.0) * c_mult
+        vibrance = preset.get('vibrance', 0.0) * c_mult
         if vibrance != 0.0:
             hsv[:, :, 1] *= (np.float32(1.0) + np.float32(vibrance) * (np.float32(1.0) - hsv[:, :, 1]))
 
-        saturation = preset.get("saturation", 0.0) * c_mult
+        saturation = preset.get('saturation', 0.0) * c_mult
         if saturation != 0.0:
             hsv[:, :, 1] *= (np.float32(1.0) + np.float32(saturation))
 
         hsv[:, :, 1] = np.clip(hsv[:, :, 1], 0.0, 1.0)
 
-        color_adj = preset.get("color_adjustments", {})
+        color_adj = preset.get('color_adjustments', {})
         hue_ranges = {
-            "red": [(0.0, 20.0), (340.0, 360.0)], "orange": [(20.0, 45.0)],
-            "yellow": [(45.0, 70.0)], "green": [(70.0, 160.0)], "blue": [(160.0, 260.0)]
+            'red': [(0.0, 20.0), (340.0, 360.0)], 'orange': [(20.0, 45.0)],
+            'yellow': [(45.0, 70.0)], 'green': [(70.0, 160.0)], 'blue': [(160.0, 260.0)]
         }
 
         for color, adjustments in color_adj.items():
             if color not in hue_ranges:
                 continue
-            h_shift = adjustments.get("hue", 0.0) * 15.0 * ca_mult     
-            s_shift = adjustments.get("sat", 0.0) * ca_mult
+            h_shift = adjustments.get('hue', 0.0) * 15.0 * ca_mult     
+            s_shift = adjustments.get('sat', 0.0) * ca_mult
             
             if h_shift == 0.0 and s_shift == 0.0:
                 continue
@@ -220,7 +245,7 @@ class PhotoEditor:
     def run_parallel_pipeline(cls, src_matrix: np.ndarray, preset: Dict[str, Any]) -> np.ndarray:
         """Scales image based on the preset percentage, then processes tiles concurrently."""
         h, w, c = src_matrix.shape
-        do_instagram_compression = preset.get("do_instagram_compression", True)
+        do_instagram_compression = preset.get('do_instagram_compression', True)
 
         if do_instagram_compression:
             max_width = 1080
@@ -228,7 +253,7 @@ class PhotoEditor:
                 aspect_ratio = h / w
                 src_matrix = cv2.resize(src_matrix, (max_width, int(max_width * aspect_ratio)), interpolation=cv2.INTER_LANCZOS4)
         else:
-            pct = int(preset.get("resolution_percentage", 100)) / 100.0
+            pct = int(preset.get('resolution_percentage', 100)) / 100.0
             if pct < 1.0:
                 src_matrix = cv2.resize(src_matrix, (int(w * pct), int(h * pct)), interpolation=cv2.INTER_LANCZOS4)
         
@@ -262,25 +287,32 @@ class PhotoEditor:
 
     @staticmethod
     def apply_crop(img: np.ndarray, preset: Dict[str, Any]) -> np.ndarray:
-        """Crops the floating-point matrix using preset geometry settings."""
+        """Applies center rotation skew corrections and slices image bounding boxes."""
         h, w, _ = img.shape
-        ratio_mode = preset.get("crop_aspect_ratio", "Free")
         
-        if ratio_mode == "Free":
-            box_w = int(max(10, min(100, preset.get("crop_free_width", 100))) / 100.0 * w)
-            box_h = int(max(10, min(100, preset.get("crop_free_height", 100))) / 100.0 * h)
+        rotation = float(preset.get('crop_rotation', 0.0))
+        if rotation != 0.0:
+            M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), rotation, 1.0)
+            fill_color = (0.0, 0.0, 0.0) if img.dtype == np.float32 else (0, 0, 0)
+            img = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_CONSTANT, borderValue=fill_color)
+            
+        ratio_mode = preset.get('crop_aspect_ratio', 'Free')
+        
+        if ratio_mode == 'Free':
+            box_w = int(max(10, min(100, preset.get('crop_free_width', 100))) / 100.0 * w)
+            box_h = int(max(10, min(100, preset.get('crop_free_height', 100))) / 100.0 * h)
         else:
-            if ratio_mode == "Original":
+            if ratio_mode == 'Original':
                 target_ratio = w / h
-            elif ratio_mode == "1:1":
+            elif ratio_mode == '1:1':
                 target_ratio = 1.0
-            elif ratio_mode == "4:5":
+            elif ratio_mode == '4:5':
                 target_ratio = 5.0 / 4.0 if w >= h else 4.0 / 5.0
-            elif ratio_mode == "5:7":
+            elif ratio_mode == '5:7':
                 target_ratio = 7.0 / 5.0 if w >= h else 5.0 / 7.0
-            elif ratio_mode == "8:10":
+            elif ratio_mode == '8:10':
                 target_ratio = 10.0 / 8.0 if w >= h else 8.0 / 10.0
-            elif ratio_mode == "16:9":
+            elif ratio_mode == '16:9':
                 target_ratio = 16.0 / 9.0 if w >= h else 9.0 / 16.0
             else:
                 target_ratio = w / h
@@ -292,12 +324,12 @@ class PhotoEditor:
                 max_w = w
                 max_h = int(w / target_ratio)
                 
-            size_scale = max(10, min(100, preset.get("crop_size", 100))) / 100.0
+            size_scale = max(10, min(100, preset.get('crop_size', 100))) / 100.0
             box_w = int(max_w * size_scale)
             box_h = int(max_h * size_scale)
             
-        cx_pct = preset.get("crop_center_x", 50) / 100.0
-        cy_pct = preset.get("crop_center_y", 50) / 100.0
+        cx_pct = preset.get('crop_center_x', 50) / 100.0
+        cy_pct = preset.get('crop_center_y', 50) / 100.0
         
         ideal_cx = int(cx_pct * w)
         ideal_cy = int(cy_pct * h)
@@ -323,10 +355,10 @@ class PhotoEditor:
     @staticmethod
     def apply_white_border(img: np.ndarray, preset: Dict[str, Any]) -> np.ndarray:
         """Appends a white border by downscaling the inner frame to keep overall dimensions exact."""
-        if not preset.get("add_white_border", False):
+        if not preset.get('add_white_border', False):
             return img
         h, w, _ = img.shape
-        border_pct = preset.get("white_border_width_pct", 5)
+        border_pct = preset.get('white_border_width_pct', 5)
         border_pixels = int(max(w, h) * (border_pct / 100.0))
         
         if border_pixels > 0 and w > 2 * border_pixels and h > 2 * border_pixels:
@@ -350,8 +382,8 @@ def export_photo(img_array: np.ndarray, output_path: str, preset: Dict[str, Any]
     img_cropped = PhotoEditor.apply_crop(img_array, preset)
     final_img_array = (np.clip(img_cropped, 0.0, 1.0) * 255.0).astype(np.uint8)
     
-    grain = preset.get("grain", 0.0)
-    grain_size = preset.get("grain_size", 1.0)
+    grain = preset.get('grain', 0.0)
+    grain_size = preset.get('grain_size', 1.0)
     if grain > 0.0:
         fh, fw, fc = final_img_array.shape
         g_size = max(0.1, grain_size)
@@ -361,24 +393,23 @@ def export_photo(img_array: np.ndarray, output_path: str, preset: Dict[str, Any]
             noise = cv2.resize(noise, (fw, fh), interpolation=cv2.INTER_LINEAR)
         final_img_array = np.clip(final_img_array.astype(np.float32) + noise, 0, 255).astype(np.uint8)
 
-    # Apply dimension-preserving white border at the very end of export chain
-    if preset.get("add_white_border", False):
+    if preset.get('add_white_border', False):
         final_img_array = PhotoEditor.apply_white_border(final_img_array, preset)
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     img_pil = Image.fromarray(final_img_array)
-    do_instagram_compression = preset.get("do_instagram_compression", True)
+    do_instagram_compression = preset.get('do_instagram_compression', True)
 
     if do_instagram_compression:
         quality = 95
         while quality >= 70:
-            img_pil.save(output_path, format="JPEG", quality=quality)
+            img_pil.save(output_path, format='JPEG', quality=quality)
             file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
             if file_size_mb <= max_mb:
                 break
             quality -= 5
     else:
-        img_pil.save(output_path, format="JPEG", quality=92)
+        img_pil.save(output_path, format='JPEG', quality=92)
 
 def playbook_single_file(file_path: str, output_dir: str, preset_data: Dict[str, Any]):
     _, input_filename = os.path.split(file_path)
