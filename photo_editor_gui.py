@@ -1,7 +1,7 @@
 """A PyQt6 desktop application wrapper for the high-precision photo editor engine.
 
-Features a multi-panel layout with continuous path memory persistence configs
-pointing safely back onto native target systems folders.
+Features an expandable vertical left-side splitter containing file tree items and
+metadata readouts, coupled with organized, collapsible right-side parameter layouts.
 """
 
 import sys
@@ -110,6 +110,42 @@ class HistogramWidget(QFrame):
         if self.clipping_right:
             painter.setPen(Qt.GlobalColor.red)
             painter.drawText(w - 110, 18, "CLIPPED WHITES")
+
+
+class CollapsibleGroupBox(QGroupBox):
+    """Custom container element introducing uniform drawer visibility states."""
+
+    def __init__(self, title: str, parent=None):
+        super().__init__(title, parent)
+        self.box_layout = QVBoxLayout(self)
+        self.box_layout.setContentsMargins(6, 8, 6, 6)
+        self.box_layout.setSpacing(4)
+
+        self.toggle_btn = QPushButton("v")
+        self.toggle_btn.setCheckable(True)
+        self.toggle_btn.setChecked(False)
+        self.toggle_btn.setStyleSheet(
+            "QPushButton { text-align: left; padding: 4px; "
+            "border: 1px solid #444; background-color: #353535; color: #eee; border-radius: 3px; }"
+            "QPushButton:checked { background-color: #252525; color: #999; }"
+        )
+        self.toggle_btn.toggled.connect(self._on_toggle_triggered)
+
+        self.content_widget = QWidget()
+        self.content_layout = QVBoxLayout(self.content_widget)
+        self.content_layout.setContentsMargins(0, 4, 0, 0)
+        self.content_layout.setSpacing(4)
+
+        self.box_layout.addWidget(self.toggle_btn)
+        self.box_layout.addWidget(self.content_widget)
+
+    def _on_toggle_triggered(self, checked: bool):
+        if checked:
+            self.content_widget.hide()
+            self.toggle_btn.setText(">")
+        else:
+            self.content_widget.show()
+            self.toggle_btn.setText("v")
 
 
 class ZoomableGraphicsView(QGraphicsView):
@@ -305,111 +341,99 @@ class MainWindow(QMainWindow):
         main_splitter.setSizes([280, 850, 370])
 
     def _build_sliders_interface(self):
-        # --- Group Preset Selection Menu Element ---
-        g_preset = QGroupBox("Preset Configuration Library")
-        vbox_p = QVBoxLayout(g_preset)
+        """Assembles interactive group layers strictly mapped to structural criteria."""
+        
+        # 1. PRESET CONFIGURATION DRAWER PANEL
+        g_preset = CollapsibleGroupBox("Preset Configuration Library")
         self.preset_combo = QComboBox()
         self.preset_combo.currentIndexChanged.connect(self._on_preset_combo_changed)
-        vbox_p.addWidget(self.preset_combo)
+        g_preset.content_layout.addWidget(self.preset_combo)
         
-        self.cb_instagram = QCheckBox("Do Instagram Compression (Bypass user % layout dimensions scaling)")
+        self.cb_instagram = QCheckBox("Do Instagram Compression (Bypass manual scaling restrictions)")
         self.cb_instagram.setChecked(True)
         self.cb_instagram.toggled.connect(lambda state: self._update_preset_key("do_instagram_compression", state))
-        vbox_p.addWidget(self.cb_instagram)
+        g_preset.content_layout.addWidget(self.cb_instagram)
 
         self.sliders_map["resolution_percentage"] = self._create_slider_row(
-            vbox_p, "Export Scale (%)", 10, 100, 100, 
+            g_preset.content_layout, "Export Scale (%)", 10, 100, 100, 
             lambda v: self._update_preset_key("resolution_percentage", v)
         )
         self.lbl_live_target_res = QLabel("Target Export Res: -")
         self.lbl_live_target_res.setStyleSheet("font-weight: bold; color: #a2a2a2;")
-        vbox_p.addWidget(self.lbl_live_target_res)
+        g_preset.content_layout.addWidget(self.lbl_live_target_res)
         self.sliders_layout.addWidget(g_preset)
 
-        # --- Group Crop & Framing Elements ---
-        g_crop = QGroupBox("Crop & Border Configuration")
-        vbox_cb = QVBoxLayout(g_crop)
-        
+        # 2. CROP & FRAMING GEOMETRY MODULE
+        g_crop = CollapsibleGroupBox("Crop & Border Configuration")
         self.crop_ratio_combo = QComboBox()
         self.crop_ratio_combo.addItems(["Free", "Original", "1:1", "4:5", "5:7", "8:10", "16:9"])
         self.crop_ratio_combo.currentTextChanged.connect(lambda txt: self._update_preset_key("crop_aspect_ratio", txt))
-        vbox_cb.addWidget(QLabel("Aspect Ratio Lock Selection:"))
-        vbox_cb.addWidget(self.crop_ratio_combo)
+        g_crop.content_layout.addWidget(QLabel("Aspect Ratio Lock Selection:"))
+        g_crop.content_layout.addWidget(self.crop_ratio_combo)
 
-        self.sliders_map["crop_size"] = self._create_slider_row(vbox_cb, "Crop Box Size (%)", 10, 100, 100, lambda v: self._update_preset_key("crop_size", v))
-        self.sliders_map["crop_free_width"] = self._create_slider_row(vbox_cb, "Crop Free Width (%)", 10, 100, 100, lambda v: self._update_preset_key("crop_free_width", v))
-        self.sliders_map["crop_free_height"] = self._create_slider_row(vbox_cb, "Crop Free Height (%)", 10, 100, 100, lambda v: self._update_preset_key("crop_free_height", v))
-        self.sliders_map["crop_center_x"] = self._create_slider_row(vbox_cb, "Crop Center X (%)", 0, 100, 50, lambda v: self._update_preset_key("crop_center_x", v))
-        self.sliders_map["crop_center_y"] = self._create_slider_row(vbox_cb, "Crop Center Y (%)", 0, 100, 50, lambda v: self._update_preset_key("crop_center_y", v))
+        self.sliders_map["crop_size"] = self._create_slider_row(g_crop.content_layout, "Crop Box Size (%)", 10, 100, 100, lambda v: self._update_preset_key("crop_size", v))
+        self.sliders_map["crop_free_width"] = self._create_slider_row(g_crop.content_layout, "Crop Free Width (%)", 10, 100, 100, lambda v: self._update_preset_key("crop_free_width", v))
+        self.sliders_map["crop_free_height"] = self._create_slider_row(g_crop.content_layout, "Crop Free Height (%)", 10, 100, 100, lambda v: self._update_preset_key("crop_free_height", v))
+        self.sliders_map["crop_center_x"] = self._create_slider_row(g_crop.content_layout, "Crop Center X (%)", 0, 100, 50, lambda v: self._update_preset_key("crop_center_x", v))
+        self.sliders_map["crop_center_y"] = self._create_slider_row(g_crop.content_layout, "Crop Center Y (%)", 0, 100, 50, lambda v: self._update_preset_key("crop_center_y", v))
         
-        vbox_cb.addSpacing(10)
+        g_crop.content_layout.addSpacing(10)
         self.cb_white_border = QCheckBox("Apply Clean White Print Frame")
         self.cb_white_border.toggled.connect(lambda state: self._update_preset_key("add_white_border", state))
-        vbox_cb.addWidget(self.cb_white_border)
+        g_crop.content_layout.addWidget(self.cb_white_border)
         
-        self.sliders_map["white_border_width_pct"] = self._create_slider_row(vbox_cb, "Border Frame Width (%)", 1, 20, 5, lambda v: self._update_preset_key("white_border_width_pct", v))
+        self.sliders_map["white_border_width_pct"] = self._create_slider_row(g_crop.content_layout, "Border Frame Width (%)", 1, 20, 5, lambda v: self._update_preset_key("white_border_width_pct", v))
         self.sliders_layout.addWidget(g_crop)
 
-        # --- Group Macro Multipliers ---
-        g_mult = QGroupBox("Macro Parameter Group Multipliers")
-        vbox_m = QVBoxLayout(g_mult)
-        self.sliders_map["values_multiplier"] = self._create_slider_row(vbox_m, "Values Shift Multiplier", 0, 100, 100, lambda v: self._update_preset_key("values_multiplier", v / 100.0))
-        self.sliders_map["color_multiplier"] = self._create_slider_row(vbox_m, "Global Color Multiplier", 0, 100, 100, lambda v: self._update_preset_key("color_multiplier", v / 100.0))
-        self.sliders_map["color_adjustments_multiplier"] = self._create_slider_row(vbox_m, "Target Bands Multiplier", 0, 100, 100, lambda v: self._update_preset_key("color_adjustments_multiplier", v / 100.0))
-        self.sliders_layout.addWidget(g_mult)
+        # 3. GLOBAL EXPOSURE & VALUES PROFILE
+        g_val = CollapsibleGroupBox("Global Exposure & Values")
+        self.sliders_map["values_multiplier"] = self._create_slider_row(g_val.content_layout, "Values Shift Multiplier", 0, 100, 100, lambda v: self._update_preset_key("values_multiplier", v / 100.0))
+        self.sliders_map["exposure"] = self._create_slider_row(g_val.content_layout, "Exposure (Stops)", -200, 200, 0, lambda v: self._update_preset_key("exposure", v / 100.0))
+        self.sliders_map["contrast"] = self._create_slider_row(g_val.content_layout, "Contrast", -100, 100, 0, lambda v: self._update_preset_key("contrast", v / 100.0))
+        self.sliders_map["highlights"] = self._create_slider_row(g_val.content_layout, "Highlights Recovery", -100, 100, 0, lambda v: self._update_preset_key("highlights", v / 100.0))
+        self.sliders_map["shadows"] = self._create_slider_row(g_val.content_layout, "Shadows Optimization", -100, 100, 0, lambda v: self._update_preset_key("shadows", v / 100.0))
+        self.sliders_map["hdr_compression"] = self._create_slider_row(g_val.content_layout, "HDR Compression Curve", 0, 100, 0, lambda v: self._update_preset_key("hdr_compression", v / 100.0))
+        self.sliders_layout.addWidget(g_val)
 
-        # --- Group White Balance ---
-        g_wb = QGroupBox("White Balance Properties")
-        vbox_wb = QVBoxLayout(g_wb)
+        # 4. GLOBAL COLOR CONFIGURATION MATRIX
+        g_col = CollapsibleGroupBox("Global Color Engine")
+        self.sliders_map["color_multiplier"] = self._create_slider_row(g_col.content_layout, "Global Color Multiplier", 0, 100, 100, lambda v: self._update_preset_key("color_multiplier", v / 100.0))
+        self.sliders_map["vibrance"] = self._create_slider_row(g_col.content_layout, "Vibrance (Muted Weight)", -100, 100, 0, lambda v: self._update_preset_key("vibrance", v / 100.0))
+        self.sliders_map["saturation"] = self._create_slider_row(g_col.content_layout, "Saturation (Linear Multiplier)", -100, 100, 0, lambda v: self._update_preset_key("saturation", v / 100.0))
+        self.sliders_layout.addWidget(g_col)
+
+        # 5. WHITE BALANCE PROPERTIES PANEL
+        g_wb = CollapsibleGroupBox("White Balance Properties")
         self.cb_apply_temp = QCheckBox("Apply Kelvin Temperature Vector Transformation")
         self.cb_apply_temp.setChecked(True)
         self.cb_apply_temp.toggled.connect(lambda state: self._update_preset_key("apply_temperature_adjustment", state))
-        vbox_wb.addWidget(self.cb_apply_temp)
-        self.sliders_map["temp_kelvin"] = self._create_slider_row(vbox_wb, "Temperature (Kelvin)", 2000, 12000, 6500, lambda v: self._update_preset_key("temp_kelvin", v))
-        self.sliders_map["tint"] = self._create_slider_row(vbox_wb, "Tint", -100, 100, 0, lambda v: self._update_preset_key("tint", v / 100.0))
+        g_wb.content_layout.addWidget(self.cb_apply_temp)
+        self.sliders_map["temp_kelvin"] = self._create_slider_row(g_wb.content_layout, "Temperature (Kelvin)", 2000, 12000, 6500, lambda v: self._update_preset_key("temp_kelvin", v))
+        self.sliders_map["tint"] = self._create_slider_row(g_wb.content_layout, "Tint", -100, 100, 0, lambda v: self._update_preset_key("tint", v / 100.0))
         self.sliders_layout.addWidget(g_wb)
 
-        # --- Group Global Lum/Contrast Values ---
-        g_val = QGroupBox("Global Exposure & Values")
-        vbox_val = QVBoxLayout(g_val)
-        self.sliders_map["hdr_compression"] = self._create_slider_row(vbox_val, "HDR Compression Curve", 0, 100, 0, lambda v: self._update_preset_key("hdr_compression", v / 100.0))
-        self.sliders_map["exposure"] = self._create_slider_row(vbox_val, "Exposure (Stops)", -200, 200, 0, lambda v: self._update_preset_key("exposure", v / 100.0))
-        self.sliders_map["contrast"] = self._create_slider_row(vbox_val, "Contrast", -100, 100, 0, lambda v: self._update_preset_key("contrast", v / 100.0))
-        self.sliders_map["highlights"] = self._create_slider_row(vbox_val, "Highlights Recovery", -100, 100, 0, lambda v: self._update_preset_key("highlights", v / 100.0))
-        self.sliders_map["shadows"] = self._create_slider_row(vbox_val, "Shadows Optimization", -100, 100, 0, lambda v: self._update_preset_key("shadows", v / 100.0))
-        self.sliders_layout.addWidget(g_val)
-
-        # --- Group Frequency Controls ---
-        g_freq = QGroupBox("Local Frequency Adjustments")
-        vbox_freq = QVBoxLayout(g_freq)
-        self.sliders_map["texture"] = self._create_slider_row(vbox_freq, "Texture Definition", -100, 100, 0, lambda v: self._update_preset_key("texture", v / 100.0))
-        self.sliders_map["clarity"] = self._create_slider_row(vbox_freq, "Clarity Profile", -100, 100, 0, lambda v: self._update_preset_key("clarity", v / 100.0))
-        self.sliders_map["gaussian_blur"] = self._create_slider_row(vbox_freq, "Gaussian Spatial Blur", 0, 50, 0, lambda v: self._update_preset_key("gaussian_blur", v / 10.0))
+        # 6. LOCAL FREQUENCY ADJUSTMENTS
+        g_freq = CollapsibleGroupBox("Local Frequency Adjustments")
+        self.sliders_map["texture"] = self._create_slider_row(g_freq.content_layout, "Texture Definition", -100, 100, 0, lambda v: self._update_preset_key("texture", v / 100.0))
+        self.sliders_map["clarity"] = self._create_slider_row(g_freq.content_layout, "Clarity Profile", -100, 100, 0, lambda v: self._update_preset_key("clarity", v / 100.0))
+        self.sliders_map["gaussian_blur"] = self._create_slider_row(g_freq.content_layout, "Gaussian Spatial Blur", 0, 50, 0, lambda v: self._update_preset_key("gaussian_blur", v / 10.0))
         self.sliders_layout.addWidget(g_freq)
 
-        # --- Group Global Colors ---
-        g_col = QGroupBox("Global Color Engine")
-        vbox_col = QVBoxLayout(g_col)
-        self.sliders_map["vibrance"] = self._create_slider_row(vbox_col, "Vibrance (Muted Weight)", -100, 100, 0, lambda v: self._update_preset_key("vibrance", v / 100.0))
-        self.sliders_map["saturation"] = self._create_slider_row(vbox_col, "Saturation (Linear Multiplier)", -100, 100, 0, lambda v: self._update_preset_key("saturation", v / 100.0))
-        self.sliders_layout.addWidget(g_col)
-
-        # --- Group Targeted Color Bands HSL ---
-        g_ca = QGroupBox("Targeted Chromatic Bands")
-        vbox_ca = QVBoxLayout(g_ca)
+        # 7. TARGETED BAND SHIFTING
+        g_ca = CollapsibleGroupBox("Targeted Chromatic Bands")
+        self.sliders_map["color_adjustments_multiplier"] = self._create_slider_row(g_ca.content_layout, "Target Bands Multiplier", 0, 100, 100, lambda v: self._update_preset_key("color_adjustments_multiplier", v / 100.0))
         for band in ["red", "orange", "yellow", "green", "blue"]:
             g_band = QGroupBox(f"Band Channel: {band.upper()}")
             vbox_b = QVBoxLayout(g_band)
             self.sliders_map[f"{band}_hue"] = self._create_slider_row(vbox_b, "Hue Shift", -100, 100, 0, lambda v, b=band: self._update_nested_color_preset(b, "hue", v / 100.0))
             self.sliders_map[f"{band}_sat"] = self._create_slider_row(vbox_b, "Saturation Intensity", -100, 100, 0, lambda v, b=band: self._update_nested_color_preset(b, "sat", v / 100.0))
-            vbox_ca.addWidget(g_band)
+            g_ca.content_layout.addWidget(g_band)
         self.sliders_layout.addWidget(g_ca)
 
-        # --- Group Stylistic Film Overlays ---
-        g_style = QGroupBox("Film Grain Overlays")
-        vbox_style = QVBoxLayout(g_style)
-        self.sliders_map["grain"] = self._create_slider_row(vbox_style, "Grain Density Strength", 0, 100, 0, lambda v: self._update_preset_key("grain", v / 100.0))
-        self.sliders_map["grain_size"] = self._create_slider_row(vbox_style, "Grain Cluster Size Scale", 1, 50, 10, lambda v: self._update_preset_key("grain_size", v / 10.0))
+        # 8. STYLISTIC FILM NOISE OVERLAYS
+        g_style = CollapsibleGroupBox("Film Grain Overlays")
+        self.sliders_map["grain"] = self._create_slider_row(g_style.content_layout, "Grain Density Strength", 0, 100, 0, lambda v: self._update_preset_key("grain", v / 100.0))
+        self.sliders_map["grain_size"] = self._create_slider_row(g_style.content_layout, "Grain Cluster Size Scale", 1, 50, 10, lambda v: self._update_preset_key("grain_size", v / 10.0))
         self.sliders_layout.addWidget(g_style)
 
     def _create_slider_row(self, parent_layout, label_text: str, mn: int, mx: int, init: int, callback) -> QSlider:
@@ -596,12 +620,6 @@ class MainWindow(QMainWindow):
             box_w = int(max_w * size_scale)
             box_h = int(max_h * size_scale)
             
-        if self.preset.get("add_white_border", False):
-            border_pct = self.preset.get("white_border_width_pct", 5)
-            border_pixels = int(max(box_w, box_h) * (border_pct / 100.0))
-            box_w += 2 * border_pixels
-            box_h += 2 * border_pixels
-            
         self.lbl_live_target_res.setText(f"Target Export Res: {box_w} x {box_h}")
 
     def _save_current_edits_to_session_cache(self):
@@ -722,19 +740,23 @@ class MainWindow(QMainWindow):
 
         if self.show_original_state:
             render_array = self.preview_matrix
+            self.histogram_widget.render_histogram(render_array)
+            img_uint8 = (np.clip(render_array, 0.0, 1.0) * 255.0).astype(np.uint8)
         else:
             render_array = PhotoEditor.run_pipeline(self.preview_matrix, self.preset)
             render_array = PhotoEditor.apply_crop(render_array, self.preset)
-            render_array = PhotoEditor.apply_white_border(render_array, self.preset)
+            
+            # Extract histogram and clip masks BEFORE appending the white border padding
+            self.histogram_widget.render_histogram(render_array)
+            img_uint8 = (np.clip(render_array, 0.0, 1.0) * 255.0).astype(np.uint8)
 
-        self.histogram_widget.render_histogram(render_array)
-
-        img_uint8 = (np.clip(render_array, 0.0, 1.0) * 255.0).astype(np.uint8)
-
-        if self.highlight_clipped_action.isChecked():
-            mask_black = (img_uint8[:, :, 0] == 0) & (img_uint8[:, :, 1] == 0) & (img_uint8[:, :, 2] == 0)
-            mask_white = (img_uint8[:, :, 0] == 255) & (img_uint8[:, :, 1] == 255) & (img_uint8[:, :, 2] == 255)
-            img_uint8[mask_black | mask_white] = [255, 0, 0]
+            if self.highlight_clipped_action.isChecked():
+                mask_black = (img_uint8[:, :, 0] == 0) & (img_uint8[:, :, 1] == 0) & (img_uint8[:, :, 2] == 0)
+                mask_white = (img_uint8[:, :, 0] == 255) & (img_uint8[:, :, 1] == 255) & (img_uint8[:, :, 2] == 255)
+                img_uint8[mask_black | mask_white] = [255, 0, 0]
+                
+            # Render white border downscaling on the isolated UI matrix view frame
+            img_uint8 = PhotoEditor.apply_white_border(img_uint8, self.preset)
 
         h, w, ch = img_uint8.shape
         q_image = QImage(img_uint8.data, w, h, ch * w, QImage.Format.Format_RGB888)

@@ -1,7 +1,7 @@
 """A headless photo editing utility mimicking basic Adobe Lightroom functionality.
 
 High-performance variation implementing a padded-stripe multi-threaded rendering
-pipeline with isolated grain, orientation-aware aspect crops, and white print borders.
+pipeline with isolated grain, orientation-aware aspect crops, and dimension-preserving white borders.
 """
 
 import argparse
@@ -133,7 +133,6 @@ class PhotoEditor:
                 del hl_mask
 
             if shadows != 0.0:
-                sh_mask = np.power(np.float32(1.0) - Skinner, 2)
                 sh_mask = np.power(np.float32(1.0) - luminance, 2)
                 img += (np.float32(shadows) * sh_mask * img * np.float32(0.5))
                 del sh_mask
@@ -323,16 +322,22 @@ class PhotoEditor:
 
     @staticmethod
     def apply_white_border(img: np.ndarray, preset: Dict[str, Any]) -> np.ndarray:
-        """Appends a pure white border canvas footprint proportional to the frame size."""
+        """Appends a white border by downscaling the inner frame to keep overall dimensions exact."""
         if not preset.get("add_white_border", False):
             return img
         h, w, _ = img.shape
         border_pct = preset.get("white_border_width_pct", 5)
         border_pixels = int(max(w, h) * (border_pct / 100.0))
-        if border_pixels > 0:
+        
+        if border_pixels > 0 and w > 2 * border_pixels and h > 2 * border_pixels:
+            inner_w = w - 2 * border_pixels
+            inner_h = h - 2 * border_pixels
+            img_resized = cv2.resize(img, (inner_w, inner_h), interpolation=cv2.INTER_LANCZOS4)
+            
+            fill_val = [1.0, 1.0, 1.0] if img.dtype == np.float32 else [255, 255, 255]
             return cv2.copyMakeBorder(
-                img, border_pixels, border_pixels, border_pixels, border_pixels,
-                cv2.BORDER_CONSTANT, value=[1.0, 1.0, 1.0]
+                img_resized, border_pixels, border_pixels, border_pixels, border_pixels,
+                cv2.BORDER_CONSTANT, value=fill_val
             )
         return img
 
@@ -341,13 +346,10 @@ class PhotoEditor:
 
 
 def export_photo(img_array: np.ndarray, output_path: str, preset: Dict[str, Any], max_mb: float = 8.0):
-    """Converts frames, applies crop structures, maps film grain, and appends print border vectors."""
-    # 1. Apply non-destructive crop transformations first
+    """Executes crop adjustments, applies targeted grain distributions, and frames image matrices."""
     img_cropped = PhotoEditor.apply_crop(img_array, preset)
-    
     final_img_array = (np.clip(img_cropped, 0.0, 1.0) * 255.0).astype(np.uint8)
     
-    # 2. Add film noise onto the cropped image context
     grain = preset.get("grain", 0.0)
     grain_size = preset.get("grain_size", 1.0)
     if grain > 0.0:
@@ -359,16 +361,9 @@ def export_photo(img_array: np.ndarray, output_path: str, preset: Dict[str, Any]
             noise = cv2.resize(noise, (fw, fh), interpolation=cv2.INTER_LINEAR)
         final_img_array = np.clip(final_img_array.astype(np.float32) + noise, 0, 255).astype(np.uint8)
 
-    # 3. Append white borders at the absolute end to isolate grain noise
+    # Apply dimension-preserving white border at the very end of export chain
     if preset.get("add_white_border", False):
-        fh, fw, fc = final_img_array.shape
-        border_pct = preset.get("white_border_width_pct", 5)
-        border_pixels = int(max(fw, fh) * (border_pct / 100.0))
-        if border_pixels > 0:
-            final_img_array = cv2.copyMakeBorder(
-                final_img_array, border_pixels, border_pixels, border_pixels, border_pixels,
-                cv2.BORDER_CONSTANT, value=[255, 255, 255]
-            )
+        final_img_array = PhotoEditor.apply_white_border(final_img_array, preset)
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     img_pil = Image.fromarray(final_img_array)
