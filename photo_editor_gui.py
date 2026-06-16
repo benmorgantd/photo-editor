@@ -1,0 +1,722 @@
+"""A PyQt6 desktop application wrapper for the high-precision photo editor engine.
+
+Features a multi-panel layout with continuous path memory persistence configs
+pointing safely back onto native target systems folders.
+"""
+
+import sys
+import os
+import json
+import datetime
+import tempfile
+import configparser
+from typing import Dict, Any
+import cv2
+import numpy as np
+
+from PyQt6.QtCore import Qt, QDir, QThread, pyqtSignal
+from PyQt6.QtGui import QImage, QPixmap, QAction, QKeySequence, QFileSystemModel, QPainter, QKeyEvent
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
+    QSplitter, QTreeView, QGraphicsView, QGraphicsScene, QPushButton,
+    QSlider, QCheckBox, QComboBox, QLabel, QGroupBox, QScrollArea, QFileDialog,
+    QFrame, QLineEdit
+)
+
+from photo_editor_core import PhotoEditor, export_photo, SUPPORTED_EXTENSIONS
+
+
+class ExportWorker(QThread):
+    """Background worker thread executing heavy matrix transformations and disk I/O."""
+    
+    progress_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(bool, str)
+
+    def __init__(self, src_matrix: np.ndarray, preset: Dict[str, Any], output_path: str):
+        super().__init__()
+        self.src_matrix = np.copy(src_matrix)
+        self.preset = json.loads(json.dumps(preset))
+        self.output_path = output_path
+
+    def run(self):
+        try:
+            self.progress_signal.emit("Executing multi-core pipeline calculation pass...")
+            processed_full = PhotoEditor.run_parallel_pipeline(self.src_matrix, self.preset)
+
+            self.progress_signal.emit("Writing compressed photo file to disk layout...")
+            export_photo(processed_full, self.output_path, self.preset)
+
+            self.finished_signal.emit(True, f"Successfully exported: {os.path.basename(self.output_path)}")
+        except Exception as e:
+            self.finished_signal.emit(False, f"Export engine failed: {str(e)}")
+
+
+class HistogramWidget(QFrame):
+    """Custom painting widget to extract and graph floating-point luminance distributions."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(115)
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setFrameShadow(QFrame.Shadow.Sunken)
+        self.hist_data = None
+        self.clipping_left = False
+        self.clipping_right = False
+
+    def render_histogram(self, rgb_matrix: np.ndarray):
+        if rgb_matrix is None:
+            self.hist_data = None
+            self.update()
+            return
+
+        gray = np.float32(0.299) * rgb_matrix[:, :, 0] + np.float32(0.587) * rgb_matrix[:, :, 1] + np.float32(0.114) * rgb_matrix[:, :, 2]
+        gray_uint8 = (np.clip(gray, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+        hist = cv2.calcHist([gray_uint8], [0], None, [256], [0, 256])
+        self.hist_data = hist
+
+        pixel_ceiling = gray_uint8.size * 0.003
+        self.clipping_left = hist[0][0] > pixel_ceiling
+        self.clipping_right = hist[255][0] > pixel_ceiling
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        rect = self.contentsRect()
+        painter.fillRect(rect, Qt.GlobalColor.black)
+
+        if self.hist_data is None:
+            return
+
+        max_val = np.max(self.hist_data[1:-1])
+        if max_val == 0: 
+            max_val = 1
+
+        w, h = rect.width(), rect.height()
+        pen = painter.pen()
+        pen.setColor(Qt.GlobalColor.darkGray)
+        painter.setPen(pen)
+
+        for i in range(256):
+            x = int((i / 256.0) * w)
+            bin_value = self.hist_data[i][0]
+            bar_height = int((bin_value / max_val) * (h - 15))
+            bar_height = min(bar_height, h - 15)
+            painter.drawLine(x, h, x, h - bar_height)
+
+        if self.clipping_left:
+            painter.setPen(Qt.GlobalColor.red)
+            painter.drawText(8, 18, "CRUSHED BLACKS")
+        if self.clipping_right:
+            painter.setPen(Qt.GlobalColor.red)
+            painter.drawText(w - 110, 18, "CLIPPED WHITES")
+
+
+class ZoomableGraphicsView(QGraphicsView):
+    """Viewport container supporting mouse wheel zooming and click-and-drag panning."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setBackgroundBrush(QApplication.palette().dark())
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+
+    def wheelEvent(self, event):
+        zoom_factor = 1.15 if event.angleDelta().y() > 0 else 0.85
+        self.scale(zoom_factor, zoom_factor)
+
+
+class MainWindow(QMainWindow):
+    """Main window object orchestrates user interface layout structures."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Lightroom Pro Desktop GUI Environment")
+        self.resize(1500, 900)
+
+        self.current_file_path = ""
+        self.full_res_matrix = None
+        self.preview_matrix = None
+        self.show_original_state = False
+        self.is_updating_ui = False
+        self.export_thread = None
+
+        self.cache_directory = os.path.join(tempfile.gettempdir(), "photo_editor_session_cache")
+        os.makedirs(self.cache_directory, exist_ok=True)
+        self.state_ini_path = os.path.join(self.cache_directory, "session_state.ini")
+
+        self.default_preset = {
+            "do_instagram_compression": True,
+            "resolution_percentage": 100,
+            "apply_temperature_adjustment": True,
+            "values_multiplier": 1.0, "color_multiplier": 1.0, "color_adjustments_multiplier": 1.0,
+            "hdr_compression": 0.0, "exposure": 0.0, "temp_kelvin": 6500, "tint": 0.0,
+            "contrast": 0.0, "highlights": 0.0, "shadows": 0.0, "texture": 0.0, "clarity": 0.0,
+            "gaussian_blur": 0.0, "vibrance": 0.0, "saturation": 0.0, "grain": 0.0, "grain_size": 1.0,
+            "color_adjustments": {
+                "red": {"hue": 0.0, "sat": 0.0}, "orange": {"hue": 0.0, "sat": 0.0},
+                "yellow": {"hue": 0.0, "sat": 0.0}, "green": {"hue": 0.0, "sat": 0.0}, "blue": {"hue": 0.0, "sat": 0.0}
+            }
+        }
+        self.preset = json.loads(json.dumps(self.default_preset))
+        self.sliders_map = {}
+
+        self._init_menu_bar()
+        self._init_ui_layout()
+        self._populate_local_presets()
+
+    def _init_menu_bar(self):
+        menu_bar = self.menuBar()
+        file_menu = menu_bar.addMenu("&File")
+
+        set_root_action = QAction("&Set Root Folder...", self)
+        set_root_action.setShortcut(QKeySequence("Ctrl+O"))
+        set_root_action.triggered.connect(self._change_root_folder)
+        file_menu.addAction(set_root_action)
+
+        file_menu.addSeparator()
+
+        open_preset_action = QAction("&Open Preset...", self)
+        open_preset_action.setShortcut(QKeySequence("Ctrl+P"))
+        open_preset_action.triggered.connect(self._open_preset_file)
+        file_menu.addAction(open_preset_action)
+
+        save_preset_action = QAction("&Save Edits to Preset...", self)
+        save_preset_action.setShortcut(QKeySequence("Ctrl+S"))
+        save_preset_action.triggered.connect(self._save_preset_file)
+        file_menu.addAction(save_preset_action)
+
+        file_menu.addSeparator()
+
+        self.export_action = QAction("&Export Selected...", self)
+        self.export_action.setShortcut(QKeySequence("Ctrl+E"))
+        self.export_action.triggered.connect(self._trigger_file_export)
+        file_menu.addAction(self.export_action)
+
+        tools_menu = menu_bar.addMenu("&Tools")
+        self.highlight_clipped_action = QAction("&Highlight Clipped Pixels", self)
+        self.highlight_clipped_action.setCheckable(True)
+        self.highlight_clipped_action.triggered.connect(self._refresh_viewport)
+        tools_menu.addAction(self.highlight_clipped_action)
+
+    def _get_initial_browsing_directory(self) -> str:
+        config = configparser.ConfigParser()
+        if os.path.exists(self.state_ini_path):
+            try:
+                config.read(self.state_ini_path)
+                saved_path = config.get("Session", "last_root_path", fallback="")
+                if saved_path and os.path.exists(saved_path):
+                    return saved_path
+            except Exception:
+                pass
+        return QDir.homePath() + "/Pictures"
+
+    def _save_browsing_directory_state(self, target_path: str):
+        config = configparser.ConfigParser()
+        config["Session"] = {"last_root_path": target_path}
+        try:
+            with open(self.state_ini_path, "w") as f:
+                config.write(f)
+        except Exception:
+            pass
+
+    def _init_ui_layout(self):
+        main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.setCentralWidget(main_splitter)
+
+        # ------------------ PANEL LEFT: FILE TREE & METADATA ------------------
+        left_splitter = QSplitter(Qt.Orientation.Vertical)
+
+        self.file_model = QFileSystemModel()
+        self.file_model.setRootPath(QDir.rootPath())
+        self.file_model.setNameFilters([f"*{ext}" for ext in SUPPORTED_EXTENSIONS])
+        self.file_model.setNameFilterDisables(False)
+
+        initial_dir = self._get_initial_browsing_directory()
+
+        self.tree_view = QTreeView()
+        self.tree_view.setModel(self.file_model)
+        self.tree_view.setRootIndex(self.file_model.index(initial_dir))
+        self.tree_view.setColumnHidden(1, True)
+        self.tree_view.setColumnHidden(2, True)
+        self.tree_view.setColumnHidden(3, True)
+        self.tree_view.clicked.connect(self._on_file_selected)
+        left_splitter.addWidget(self.tree_view)
+
+        self.info_panel = QGroupBox("Active Metadata Profiles")
+        vbox_info = QVBoxLayout(self.info_panel)
+        vbox_info.setSpacing(6)
+        
+        self.lbl_info_name = QLabel("Name: None Loaded")
+        self.lbl_info_res = QLabel("Original Resolution: -")
+        self.lbl_info_date = QLabel("Date Modified: -")
+        self.lbl_info_size = QLabel("File Disk Size: -")
+        
+        for widget in [self.lbl_info_name, self.lbl_info_res, self.lbl_info_date, self.lbl_info_size]:
+            widget.setWordWrap(True)
+            vbox_info.addWidget(widget)
+        vbox_info.addStretch()
+        
+        left_splitter.addWidget(self.info_panel)
+        left_splitter.setSizes([600, 300])
+        main_splitter.addWidget(left_splitter)
+
+        # ------------------ PANEL CENTER: VIEWPORT ------------------
+        center_widget = QWidget()
+        center_layout = QVBoxLayout(center_widget)
+
+        self.scene = QGraphicsScene()
+        self.view = ZoomableGraphicsView(self.scene)
+        center_layout.addWidget(self.view)
+
+        control_row = QHBoxLayout()
+        self.toggle_btn = QPushButton("Toggle View: Original / Edited [Hold '\\' Key]")
+        self.toggle_btn.setCheckable(True)
+        self.toggle_btn.clicked.connect(self._on_toggle_view_clicked)
+        control_row.addWidget(self.toggle_btn)
+        center_layout.addLayout(control_row)
+        main_splitter.addWidget(center_widget)
+
+        # ------------------ PANEL RIGHT: SLIDERS CONTROL PANEL ------------------
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        right_panel = QWidget()
+        self.sliders_layout = QVBoxLayout(right_panel)
+
+        self.histogram_widget = HistogramWidget()
+        self.sliders_layout.addWidget(self.histogram_widget)
+
+        self._build_sliders_interface()
+
+        scroll_area.setWidget(right_panel)
+        main_splitter.addWidget(scroll_area)
+        main_splitter.setSizes([280, 850, 370])
+
+    def _build_sliders_interface(self):
+        # --- Group Preset Selection Menu Element ---
+        g_preset = QGroupBox("Preset Configuration Library")
+        vbox_p = QVBoxLayout(g_preset)
+        self.preset_combo = QComboBox()
+        self.preset_combo.currentIndexChanged.connect(self._on_preset_combo_changed)
+        vbox_p.addWidget(self.preset_combo)
+        
+        self.cb_instagram = QCheckBox("Do Instagram Compression (Bypass user % layout dimensions scaling)")
+        self.cb_instagram.setChecked(True)
+        self.cb_instagram.toggled.connect(lambda state: self._update_preset_key("do_instagram_compression", state))
+        vbox_p.addWidget(self.cb_instagram)
+
+        self.sliders_map["resolution_percentage"] = self._create_slider_row(
+            vbox_p, "Export Scale (%)", 10, 100, 100, 
+            lambda v: self._update_preset_key("resolution_percentage", v)
+        )
+        self.lbl_live_target_res = QLabel("Target Export Res: -")
+        self.lbl_live_target_res.setStyleSheet("font-weight: bold; color: #a2a2a2;")
+        vbox_p.addWidget(self.lbl_live_target_res)
+
+        self.sliders_layout.addWidget(g_preset)
+
+        # --- Group Macro Multipliers ---
+        g_mult = QGroupBox("Macro Parameter Group Multipliers")
+        vbox_m = QVBoxLayout(g_mult)
+        self.sliders_map["values_multiplier"] = self._create_slider_row(vbox_m, "Values Shift Multiplier", 0, 100, 100, lambda v: self._update_preset_key("values_multiplier", v / 100.0))
+        self.sliders_map["color_multiplier"] = self._create_slider_row(vbox_m, "Global Color Multiplier", 0, 100, 100, lambda v: self._update_preset_key("color_multiplier", v / 100.0))
+        self.sliders_map["color_adjustments_multiplier"] = self._create_slider_row(vbox_m, "Target Bands Multiplier", 0, 100, 100, lambda v: self._update_preset_key("color_adjustments_multiplier", v / 100.0))
+        self.sliders_layout.addWidget(g_mult)
+
+        # --- Group White Balance ---
+        g_wb = QGroupBox("White Balance Properties")
+        vbox_wb = QVBoxLayout(g_wb)
+        self.cb_apply_temp = QCheckBox("Apply Kelvin Temperature Vector Transformation")
+        self.cb_apply_temp.setChecked(True)
+        self.cb_apply_temp.toggled.connect(lambda state: self._update_preset_key("apply_temperature_adjustment", state))
+        vbox_wb.addWidget(self.cb_apply_temp)
+        self.sliders_map["temp_kelvin"] = self._create_slider_row(vbox_wb, "Temperature (Kelvin)", 2000, 12000, 6500, lambda v: self._update_preset_key("temp_kelvin", v))
+        self.sliders_map["tint"] = self._create_slider_row(vbox_wb, "Tint", -100, 100, 0, lambda v: self._update_preset_key("tint", v / 100.0))
+        self.sliders_layout.addWidget(g_wb)
+
+        # --- Group Global Lum/Contrast Values ---
+        g_val = QGroupBox("Global Exposure & Values")
+        vbox_val = QVBoxLayout(g_val)
+        self.sliders_map["hdr_compression"] = self._create_slider_row(vbox_val, "HDR Compression Curve", 0, 100, 0, lambda v: self._update_preset_key("hdr_compression", v / 100.0))
+        self.sliders_map["exposure"] = self._create_slider_row(vbox_val, "Exposure (Stops)", -200, 200, 0, lambda v: self._update_preset_key("exposure", v / 100.0))
+        self.sliders_map["contrast"] = self._create_slider_row(vbox_val, "Contrast", -100, 100, 0, lambda v: self._update_preset_key("contrast", v / 100.0))
+        self.sliders_map["highlights"] = self._create_slider_row(vbox_val, "Highlights Recovery", -100, 100, 0, lambda v: self._update_preset_key("highlights", v / 100.0))
+        self.sliders_map["shadows"] = self._create_slider_row(vbox_val, "Shadows Optimization", -100, 100, 0, lambda v: self._update_preset_key("shadows", v / 100.0))
+        self.sliders_layout.addWidget(g_val)
+
+        # --- Group Frequency Controls ---
+        g_freq = QGroupBox("Local Frequency Adjustments")
+        vbox_freq = QVBoxLayout(g_freq)
+        self.sliders_map["texture"] = self._create_slider_row(vbox_freq, "Texture Definition", -100, 100, 0, lambda v: self._update_preset_key("texture", v / 100.0))
+        self.sliders_map["clarity"] = self._create_slider_row(vbox_freq, "Clarity Profile", -100, 100, 0, lambda v: self._update_preset_key("clarity", v / 100.0))
+        self.sliders_map["gaussian_blur"] = self._create_slider_row(vbox_freq, "Gaussian Spatial Blur", 0, 50, 0, lambda v: self._update_preset_key("gaussian_blur", v / 10.0))
+        self.sliders_layout.addWidget(g_freq)
+
+        # --- Group Global Colors ---
+        g_col = QGroupBox("Global Color Engine")
+        vbox_col = QVBoxLayout(g_col)
+        self.sliders_map["vibrance"] = self._create_slider_row(vbox_col, "Vibrance (Muted Weight)", -100, 100, 0, lambda v: self._update_preset_key("vibrance", v / 100.0))
+        self.sliders_map["saturation"] = self._create_slider_row(vbox_col, "Saturation (Linear Multiplier)", -100, 100, 0, lambda v: self._update_preset_key("saturation", v / 100.0))
+        self.sliders_layout.addWidget(g_col)
+
+        # --- Group Targeted Color Bands HSL ---
+        g_ca = QGroupBox("Targeted Chromatic Bands")
+        vbox_ca = QVBoxLayout(g_ca)
+        for band in ["red", "orange", "yellow", "green", "blue"]:
+            g_band = QGroupBox(f"Band Channel: {band.upper()}")
+            vbox_b = QVBoxLayout(g_band)
+            self.sliders_map[f"{band}_hue"] = self._create_slider_row(vbox_b, "Hue Shift", -100, 100, 0, lambda v, b=band: self._update_nested_color_preset(b, "hue", v / 100.0))
+            self.sliders_map[f"{band}_sat"] = self._create_slider_row(vbox_b, "Saturation Intensity", -100, 100, 0, lambda v, b=band: self._update_nested_color_preset(b, "sat", v / 100.0))
+            vbox_ca.addWidget(g_band)
+        self.sliders_layout.addWidget(g_ca)
+
+        # --- Group Stylistic Film Overlays ---
+        g_style = QGroupBox("Film Grain Overlays")
+        vbox_style = QVBoxLayout(g_style)
+        self.sliders_map["grain"] = self._create_slider_row(vbox_style, "Grain Density Strength", 0, 100, 0, lambda v: self._update_preset_key("grain", v / 100.0))
+        self.sliders_map["grain_size"] = self._create_slider_row(vbox_style, "Grain Cluster Size Scale", 1, 50, 10, lambda v: self._update_preset_key("grain_size", v / 10.0))
+        self.sliders_layout.addWidget(g_style)
+
+    def _create_slider_row(self, parent_layout, label_text: str, mn: int, mx: int, init: int, callback) -> QSlider:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 2, 0, 2)
+
+        lbl = QLabel(label_text)
+        lbl.setMinimumWidth(130)
+        
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(mn, mx)
+        slider.setValue(init)
+
+        value_edit = QLineEdit(str(init))
+        value_edit.setFixedWidth(50)
+        value_edit.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        def on_slider_changed(val):
+            if not self.is_updating_ui:
+                value_edit.setText(str(val))
+                callback(val)
+
+        def on_text_confirmed():
+            if self.is_updating_ui: 
+                return
+            try:
+                val = int(value_edit.text())
+                val = max(mn, min(mx, val))
+                self.is_updating_ui = True
+                slider.setValue(val)
+                self.is_updating_ui = False
+                value_edit.setText(str(val))
+                callback(val)
+            except ValueError:
+                value_edit.setText(str(slider.value()))
+
+        slider.valueChanged.connect(on_slider_changed)
+        value_edit.editingFinished.connect(on_text_confirmed)
+        
+        layout.addWidget(lbl)
+        layout.addWidget(slider)
+        layout.addWidget(value_edit)
+        parent_layout.addWidget(row)
+        return slider
+
+    def keyPressEvent(self, event: QKeyEvent):
+        if event.key() == Qt.Key.Key_Backslash and not event.isAutoRepeat():
+            self.show_original_state = True
+            self.toggle_btn.setChecked(True)
+            self._refresh_viewport()
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event: QKeyEvent):
+        if event.key() == Qt.Key.Key_Backslash and not event.isAutoRepeat():
+            self.show_original_state = False
+            self.toggle_btn.setChecked(False)
+            self._refresh_viewport()
+        super().keyReleaseEvent(event)
+
+    def _populate_local_presets(self):
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        self.preset_combo.addItem("Select a workspace preset...")
+        try:
+            script_dir = os.path.dirname(os.path.abspath(__file__)) or os.getcwd()
+            files = [f for f in os.listdir(script_dir) if f.lower().endswith(".json")]
+            for f in sorted(files):
+                self.preset_combo.addItem(f)
+        except Exception as e:
+            self.statusBar().showMessage(f"Local file directory parse failure alert: {e}")
+        self.preset_combo.blockSignals(False)
+
+    def _on_preset_combo_changed(self, index: int):
+        if index <= 0: 
+            return
+        filename = self.preset_combo.itemText(index)
+        script_dir = os.path.dirname(os.path.abspath(__file__)) or os.getcwd()
+        self._load_preset_from_path(os.path.join(script_dir, filename))
+
+    def _load_preset_from_path(self, path: str):
+        try:
+            with open(path, "r") as f:
+                loaded_preset = json.load(f)
+
+            sanitized_preset = json.loads(json.dumps(self.default_preset))
+            for k, v in loaded_preset.items():
+                if k == "color_adjustments" and isinstance(v, dict):
+                    for band, values in v.items():
+                        if band in sanitized_preset["color_adjustments"] and isinstance(values, dict):
+                            sanitized_preset["color_adjustments"][band].update(values)
+                else:
+                    sanitized_preset[k] = v
+
+            self.preset = sanitized_preset
+            self._apply_preset_to_ui()
+            self._save_current_edits_to_session_cache()
+            self.statusBar().showMessage(f"Successfully loaded file preset metrics: {os.path.basename(path)}")
+        except Exception as e:
+            self.statusBar().showMessage(f"Failed to cleanly unpack file preset layout properties: {e}")
+
+    def _apply_preset_to_ui(self):
+        self.is_updating_ui = True
+        self.cb_instagram.setChecked(self.preset.get("do_instagram_compression", True))
+        self.cb_apply_temp.setChecked(self.preset.get("apply_temperature_adjustment", True))
+
+        self.sliders_map["resolution_percentage"].setValue(int(self.preset.get("resolution_percentage", 100)))
+
+        self.sliders_map["values_multiplier"].setValue(int(self.preset.get("values_multiplier", 1.0) * 100))
+        self.sliders_map["color_multiplier"].setValue(int(self.preset.get("color_multiplier", 1.0) * 100))
+        self.sliders_map["color_adjustments_multiplier"].setValue(int(self.preset.get("color_adjustments_multiplier", 1.0) * 100))
+
+        self.sliders_map["temp_kelvin"].setValue(int(self.preset.get("temp_kelvin", 6500)))
+        self.sliders_map["tint"].setValue(int(self.preset.get("tint", 0.0) * 100))
+        self.sliders_map["hdr_compression"].setValue(int(self.preset.get("hdr_compression", 0.0) * 100))
+        self.sliders_map["exposure"].setValue(int(self.preset.get("exposure", 0.0) * 100))
+        self.sliders_map["contrast"].setValue(int(self.preset.get("contrast", 0.0) * 100))
+        self.sliders_map["highlights"].setValue(int(self.preset.get("highlights", 0.0) * 100))
+        self.sliders_map["shadows"].setValue(int(self.preset.get("shadows", 0.0) * 100))
+
+        self.sliders_map["texture"].setValue(int(self.preset.get("texture", 0.0) * 100))
+        self.sliders_map["clarity"].setValue(int(self.preset.get("clarity", 0.0) * 100))
+        self.sliders_map["gaussian_blur"].setValue(int(self.preset.get("gaussian_blur", 0.0) * 10))
+        self.sliders_map["vibrance"].setValue(int(self.preset.get("vibrance", 0.0) * 100))
+        self.sliders_map["saturation"].setValue(int(self.preset.get("saturation", 0.0) * 100))
+
+        color_adj = self.preset.get("color_adjustments", {})
+        for band in ["red", "orange", "yellow", "green", "blue"]:
+            band_data = color_adj.get(band, {"hue": 0.0, "sat": 0.0})
+            self.sliders_map[f"{band}_hue"].setValue(int(band_data.get("hue", 0.0) * 100))
+            self.sliders_map[f"{band}_sat"].setValue(int(band_data.get("sat", 0.0) * 100))
+
+        self.sliders_map["grain"].setValue(int(self.preset.get("grain", 0.0) * 100))
+        self.sliders_map["grain_size"].setValue(int(self.preset.get("grain_size", 1.0) * 10))
+
+        self.is_updating_ui = False
+        self._update_target_resolution_label()
+        self._refresh_viewport()
+
+    def _update_target_resolution_label(self):
+        if self.full_res_matrix is None:
+            self.lbl_live_target_res.setText("Target Export Res: -")
+            return
+            
+        h, w, _ = self.full_res_matrix.shape
+        if self.preset.get("do_instagram_compression", True):
+            if w > 1080:
+                aspect = h / w
+                self.lbl_live_target_res.setText(f"Target Export Res: 1080 x {int(1080 * aspect)} (Instagram Scale)")
+            else:
+                self.lbl_live_target_res.setText(f"Target Export Res: {w} x {h} (Native Bounds)")
+        else:
+            pct = self.preset.get("resolution_percentage", 100) / 100.0
+            self.lbl_live_target_res.setText(f"Target Export Res: {int(w * pct)} x {int(h * pct)} ({int(pct * 100)}%)")
+
+    def _save_current_edits_to_session_cache(self):
+        if not self.current_file_path: 
+            return
+        filename = os.path.basename(self.current_file_path)
+        cache_target_path = os.path.join(self.cache_directory, f"{filename}.json")
+        try:
+            with open(cache_target_path, "w") as f:
+                json.dump(self.preset, f, indent=2)
+        except Exception:
+            pass
+
+    def _update_preset_key(self, key: str, value: Any):
+        self.preset[key] = value
+        if not self.is_updating_ui:
+            if key in ["resolution_percentage", "do_instagram_compression"]:
+                self._update_target_resolution_label()
+            self._save_current_edits_to_session_cache()
+            self._refresh_viewport()
+
+    def _update_nested_color_preset(self, band: str, prop: str, value: float):
+        self.preset["color_adjustments"][band][prop] = value
+        if not self.is_updating_ui:
+            self._save_current_edits_to_session_cache()
+            self._refresh_viewport()
+
+    def _open_preset_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Open Preset JSON Configuration", "", "JSON Configurations (*.json)")
+        if path:
+            self._load_preset_from_path(path)
+            combo_idx = self.preset_combo.findText(os.path.basename(path))
+            self.preset_combo.setCurrentIndex(combo_idx if combo_idx >= 0 else 0)
+
+    def _save_preset_file(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save Current Edits As Preset JSON", "", "JSON Configurations (*.json)")
+        if path:
+            try:
+                with open(path, "w") as f:
+                    json.dump(self.preset, f, indent=2)
+                self.statusBar().showMessage(f"Successfully saved preset configuration out to: {os.path.basename(path)}")
+                self._populate_local_presets()
+                combo_idx = self.preset_combo.findText(os.path.basename(path))
+                if combo_idx >= 0: 
+                    self.preset_combo.setCurrentIndex(combo_idx)
+            except Exception as e:
+                self.statusBar().showMessage(f"Preset writing serialization error failure: {e}")
+
+    def _change_root_folder(self):
+        start_dir = self.current_file_path if self.current_file_path else QDir.currentPath()
+        if os.path.isfile(start_dir): 
+            start_dir = os.path.dirname(start_dir)
+        selected_dir = QFileDialog.getExistingDirectory(self, "Select Project Root Directory", start_dir, QFileDialog.Option.ShowDirsOnly)
+        if selected_dir:
+            self.tree_view.setRootIndex(self.file_model.index(selected_dir))
+            self._save_browsing_directory_state(selected_dir)
+            self.statusBar().showMessage(f"Tree viewport root path set to: {selected_dir}")
+
+    def _on_file_selected(self, index):
+        path = self.file_model.filePath(index)
+        if os.path.isdir(path): 
+            return
+
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in SUPPORTED_EXTENSIONS: 
+            return
+
+        self.current_file_path = path
+        self.statusBar().showMessage(f"Loading image asset: {os.path.basename(path)}")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+
+        try:
+            self.full_res_matrix = PhotoEditor.load_image_matrix(path)
+            h, w, _ = self.full_res_matrix.shape
+            
+            self.lbl_info_name.setText(f"Name: {os.path.basename(path)}")
+            self.lbl_info_res.setText(f"Original Resolution: {w} x {h}")
+            
+            mtime = os.path.getmtime(path)
+            date_str = datetime.datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')
+            self.lbl_info_date.setText(f"Date Modified: {date_str}")
+            
+            size_mb = os.path.getsize(path) / (1024 * 1024)
+            self.lbl_info_size.setText(f"File Disk Size: {size_mb:.2f} MB")
+
+            preview_width = 1200
+            if w > preview_width:
+                aspect = h / w
+                self.preview_matrix = cv2.resize(self.full_res_matrix, (preview_width, int(preview_width * aspect)), interpolation=cv2.INTER_AREA)
+            else:
+                self.preview_matrix = np.copy(self.full_res_matrix)
+
+            filename = os.path.basename(path)
+            cache_target_path = os.path.join(self.cache_directory, f"{filename}.json")
+            if os.path.exists(cache_target_path):
+                try:
+                    with open(cache_target_path, "r") as f:
+                        self.preset = json.load(f)
+                except Exception:
+                    self.preset = json.loads(json.dumps(self.default_preset))
+            else:
+                self.preset = json.loads(json.dumps(self.default_preset))
+
+            self._apply_preset_to_ui()
+            
+            self._save_browsing_directory_state(os.path.dirname(path))
+            self.statusBar().showMessage(f"Active workspace file: {os.path.basename(path)}")
+        except Exception as e:
+            self.statusBar().showMessage(f"Critical load validation error exception encountered: {e}")
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def _on_toggle_view_clicked(self, checked):
+        self.show_original_state = checked
+        self._refresh_viewport()
+
+    def _refresh_viewport(self):
+        if self.preview_matrix is None: 
+            return
+
+        if self.show_original_state:
+            render_array = self.preview_matrix
+        else:
+            render_array = PhotoEditor.run_pipeline(self.preview_matrix, self.preset)
+
+        self.histogram_widget.render_histogram(render_array)
+
+        img_uint8 = (np.clip(render_array, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+        if self.highlight_clipped_action.isChecked():
+            mask_black = (img_uint8[:, :, 0] == 0) & (img_uint8[:, :, 1] == 0) & (img_uint8[:, :, 2] == 0)
+            mask_white = (img_uint8[:, :, 0] == 255) & (img_uint8[:, :, 1] == 255) & (img_uint8[:, :, 2] == 255)
+            img_uint8[mask_black | mask_white] = [255, 0, 0]
+
+        h, w, ch = img_uint8.shape
+        q_image = QImage(img_uint8.data, w, h, ch * w, QImage.Format.Format_RGB888)
+        pixmap = QPixmap.fromImage(q_image)
+
+        self.scene.clear()
+        self.scene.addPixmap(pixmap)
+        self.scene.setSceneRect(0, 0, w, h)
+
+    def _trigger_file_export(self):
+        if self.full_res_matrix is None or not self.current_file_path:
+            self.statusBar().showMessage("Export failure: No active file target data mapping available.")
+            return
+
+        if self.export_thread and self.export_thread.isRunning():
+            self.statusBar().showMessage("An export thread is already running in the background.")
+            return
+
+        suggested_dir = os.path.join(os.path.dirname(self.current_file_path), "edits")
+        os.makedirs(suggested_dir, exist_ok=True)
+        
+        base_name = os.path.splitext(os.path.basename(self.current_file_path))[0]
+        default_out = os.path.join(suggested_dir, f"{base_name}_edit.jpg")
+
+        out_path, _ = QFileDialog.getSaveFileName(self, "Export Production Clean Photo Matrix Asset", default_out, "JPEG Image Map (*.jpg)")
+        if not out_path: 
+            return
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self.export_action.setEnabled(False)
+
+        self.export_thread = ExportWorker(self.full_res_matrix, self.preset, out_path)
+        self.export_thread.progress_signal.connect(self.statusBar().showMessage)
+        self.export_thread.finished_signal.connect(self._on_export_thread_completed)
+        self.export_thread.start()
+
+    def _on_export_thread_completed(self, success: bool, message: str):
+        QApplication.restoreOverrideCursor()
+        self.export_action.setEnabled(True)
+        self.statusBar().showMessage(message)
+        if self.export_thread:
+            self.export_thread.quit()
+            self.export_thread.wait()
+            self.export_thread = None
+
+
+def main():
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
