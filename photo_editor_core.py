@@ -137,11 +137,13 @@ class PhotoEditor:
         whites = preset.get('whites', 0.0) * v_mult
         blacks = preset.get('blacks', 0.0) * v_mult
         if whites != 0.0 or blacks != 0.0:
-            w_thr = 1.0 - (whites * 0.15)
-            b_thr = 0.0 - (blacks * 0.15)
+            w_thr = np.float32(1.0 - (whites * 0.15))
+            b_thr = np.float32(0.0 - (blacks * 0.15))
             if w_thr <= b_thr:
-                w_thr = b_thr + 0.01
+                w_thr = b_thr + np.float32(0.01)
+            
             img = (img - b_thr) / (w_thr - b_thr)
+            img = img.astype(np.float32)
             np.clip(img, 0.0, 1.0, out=img)
 
         # 6. Highlights and Shadows
@@ -243,22 +245,23 @@ class PhotoEditor:
 
     @classmethod
     def run_parallel_pipeline(cls, src_matrix: np.ndarray, preset: Dict[str, Any]) -> np.ndarray:
-        """Scales image based on the preset percentage, then processes tiles concurrently."""
+        """Scales pre-cropped image matrices to match compression dimensions, then processes tiles concurrently."""
         h, w, c = src_matrix.shape
         do_instagram_compression = preset.get('do_instagram_compression', True)
 
+        # Enforce exact dynamic range optimization target dimensions cleanly
         if do_instagram_compression:
-            max_width = 1080
-            if w > max_width:
+            target_w = 1080
+            if w != target_w:
                 aspect_ratio = h / w
-                src_matrix = cv2.resize(src_matrix, (max_width, int(max_width * aspect_ratio)), interpolation=cv2.INTER_LANCZOS4)
+                src_matrix = cv2.resize(src_matrix, (target_w, int(target_w * aspect_ratio)), interpolation=cv2.INTER_LANCZOS4)
         else:
             pct = int(preset.get('resolution_percentage', 100)) / 100.0
             if pct < 1.0:
                 src_matrix = cv2.resize(src_matrix, (int(w * pct), int(h * pct)), interpolation=cv2.INTER_LANCZOS4)
         
         h, w, c = src_matrix.shape
-        if h < 500 or w < 500:
+        if h < 100 or w < 100:
             return cls.run_pipeline(src_matrix, preset)
 
         output_matrix = np.empty_like(src_matrix)
@@ -301,6 +304,8 @@ class PhotoEditor:
         if ratio_mode == 'Free':
             box_w = int(max(10, min(100, preset.get('crop_free_width', 100))) / 100.0 * w)
             box_h = int(max(10, min(100, preset.get('crop_free_height', 100))) / 100.0 * h)
+            if preset.get('crop_aspect_ratio_flipped', False):
+                box_w, box_h = box_h, box_w
         else:
             if ratio_mode == 'Original':
                 target_ratio = w / h
@@ -316,6 +321,9 @@ class PhotoEditor:
                 target_ratio = 16.0 / 9.0 if w >= h else 9.0 / 16.0
             else:
                 target_ratio = w / h
+                
+            if preset.get('crop_aspect_ratio_flipped', False):
+                target_ratio = 1.0 / target_ratio
                 
             if w / h >= target_ratio:
                 max_h = h
@@ -374,13 +382,13 @@ class PhotoEditor:
         return img
 
     def apply_presets(self, preset: Dict[str, Any]) -> np.ndarray:
-        return self.run_parallel_pipeline(self.original_image, preset)
+        cropped = self.apply_crop(self.original_image, preset)
+        return self.run_parallel_pipeline(cropped, preset)
 
 
 def export_photo(img_array: np.ndarray, output_path: str, preset: Dict[str, Any], max_mb: float = 8.0):
-    """Executes crop adjustments, applies targeted grain distributions, and frames image matrices."""
-    img_cropped = PhotoEditor.apply_crop(img_array, preset)
-    final_img_array = (np.clip(img_cropped, 0.0, 1.0) * 255.0).astype(np.uint8)
+    """Applies film noise grain overlays and frames pre-cropped, processed image matrices."""
+    final_img_array = (np.clip(img_array, 0.0, 1.0) * 255.0).astype(np.uint8)
     
     grain = preset.get('grain', 0.0)
     grain_size = preset.get('grain_size', 1.0)

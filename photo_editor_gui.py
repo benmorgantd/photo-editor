@@ -10,13 +10,14 @@ import json
 import datetime
 import tempfile
 import configparser
+import base64
 from typing import Dict, Any
 import cv2
 import numpy as np
 import rawpy
 
 from PyQt6.QtCore import Qt, QDir, QThread, pyqtSignal, QTimer, QEvent, QModelIndex
-from PyQt6.QtGui import QImage, QPixmap, QAction, QKeySequence, QFileSystemModel, QPainter, QKeyEvent, QCursor
+from PyQt6.QtGui import QImage, QPixmap, QAction, QKeySequence, QFileSystemModel, QPainter, QKeyEvent, QCursor, QFont
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QSplitter, QTreeView, QGraphicsView, QGraphicsScene, QPushButton,
@@ -44,8 +45,11 @@ class ExportWorker(QThread):
             self.progress_signal.emit("Loading full resolution raw asset matrix...")
             full_res = PhotoEditor.load_image_matrix(self.image_path, preview=False)
 
+            self.progress_signal.emit("Applying full resolution crop framing bounds...")
+            cropped_full = PhotoEditor.apply_crop(full_res, self.preset)
+
             self.progress_signal.emit("Executing multi-core pipeline calculation pass...")
-            processed_full = PhotoEditor.run_parallel_pipeline(full_res, self.preset)
+            processed_full = PhotoEditor.run_parallel_pipeline(cropped_full, self.preset)
 
             self.progress_signal.emit("Writing compressed photo file to disk layout...")
             export_photo(processed_full, self.output_path, self.preset)
@@ -77,6 +81,16 @@ class CustomFileSystemModel(QFileSystemModel):
                 suffix += " 💾"
 
             return f"{prefix}{base_string}{suffix}"
+            
+        if role == Qt.ItemDataRole.FontRole:
+            path = self.filePath(index)
+            if path in self.main_window.edited_files:
+                font = super().data(index, role)
+                if not isinstance(font, QFont):
+                    font = QFont()
+                font.setItalic(True)
+                return font
+                
         return super().data(index, role)
 
 
@@ -214,15 +228,16 @@ class MainWindow(QMainWindow):
         self.state_ini_path = os.path.join(self.cache_directory, "session_state.ini")
         self.registry_json_path = os.path.join(self.cache_directory, "file_status_registry.json")
 
-        # Load persisted status markers 
         self.starred_files = set()
         self.exported_files = set()
+        self.edited_files = set()
         self._load_file_status_registry()
 
         self.default_preset = {
             "do_instagram_compression": True,
             "resolution_percentage": 100,
             "crop_aspect_ratio": "Free",
+            "crop_aspect_ratio_flipped": False,
             "crop_rotation": 0,
             "crop_size": 100,
             "crop_center_x": 50,
@@ -234,7 +249,7 @@ class MainWindow(QMainWindow):
             "apply_temperature_adjustment": True,
             "values_multiplier": 1.0, "color_multiplier": 1.0, "color_adjustments_multiplier": 1.0,
             "hdr_compression": 0.0, "exposure": 0.0, "contrast": 0.0,
-            "whites": 0.0, "blacks": 0.0, # Added value parameters
+            "whites": 0.0, "blacks": 0.0,
             "highlights": 0.0, "shadows": 0.0, "texture": 0.0, "clarity": 0.0,
             "gaussian_blur": 0.0, "vibrance": 0.0, "saturation": 0.0, "grain": 0.0, "grain_size": 1.0,
             "temp_kelvin": 6500, "tint": 0.0,
@@ -262,6 +277,10 @@ class MainWindow(QMainWindow):
         self.hover_target_path = ""
 
         self.showMaximized()
+
+    def _get_cache_filename(self, absolute_path: str) -> str:
+        encoded_bytes = base64.urlsafe_b64encode(absolute_path.encode('utf-8'))
+        return encoded_bytes.decode('utf-8') + ".json"
 
     def _init_menu_bar(self):
         menu_bar = self.menuBar()
@@ -317,6 +336,17 @@ class MainWindow(QMainWindow):
                     data = json.load(f)
                     self.starred_files = set(data.get("starred_paths", []))
                     self.exported_files = set(data.get("exported_paths", []))
+            except Exception:
+                pass
+
+        for filename in os.listdir(self.cache_directory):
+            if filename in ("file_status_registry.json", "session_state.ini") or not filename.endswith(".json"):
+                continue
+            try:
+                b64_part = filename[:-5]
+                decoded_path = base64.urlsafe_b64decode(b64_part.encode('utf-8')).decode('utf-8')
+                if os.path.exists(decoded_path):
+                    self.edited_files.add(decoded_path)
             except Exception:
                 pass
 
@@ -382,7 +412,6 @@ class MainWindow(QMainWindow):
         # ------------------ PANEL LEFT: FILE TREE & METADATA ------------------
         left_splitter = QSplitter(Qt.Orientation.Vertical)
 
-        # Connected back to the CustomFileSystemModel subclass architecture
         self.file_model = CustomFileSystemModel(self)
         self.file_model.setRootPath(QDir.rootPath())
         self.file_model.setNameFilters([f"*{ext}" for ext in SUPPORTED_EXTENSIONS])
@@ -398,7 +427,6 @@ class MainWindow(QMainWindow):
         self.tree_view.setColumnHidden(3, True)
         self.tree_view.clicked.connect(self._on_file_selected)
         
-        # Rig context actions 
         self.tree_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree_view.customContextMenuRequested.connect(self._show_tree_context_menu)
         
@@ -531,6 +559,14 @@ class MainWindow(QMainWindow):
         self._save_file_status_registry()
         self.file_model.layoutChanged.emit()
 
+    def _toggle_aspect_ratio_flip(self):
+        is_flipped = self.preset.get("crop_aspect_ratio_flipped", False)
+        self.preset["crop_aspect_ratio_flipped"] = not is_flipped
+        if not self.is_updating_ui:
+            self._update_target_resolution_label()
+            self._save_current_edits_to_session_cache()
+            self._refresh_viewport()
+
     def _build_sliders_interface(self):
         """Assembles interactive group layers strictly mapped to structural criteria."""
         
@@ -562,6 +598,10 @@ class MainWindow(QMainWindow):
         g_crop.content_layout.addWidget(QLabel("Aspect Ratio Lock Selection:"))
         g_crop.content_layout.addWidget(self.crop_ratio_combo)
 
+        self.flip_ratio_btn = QPushButton("🔄 Flip Aspect Ratio Orientation")
+        self.flip_ratio_btn.clicked.connect(self._toggle_aspect_ratio_flip)
+        g_crop.content_layout.addWidget(self.flip_ratio_btn)
+
         self.sliders_map["crop_rotation"] = self._create_slider_row(g_crop.content_layout, "Crop Rotation (°)", -45, 45, 0, lambda v: self._update_preset_key("crop_rotation", v))
         self.sliders_map["crop_size"] = self._create_slider_row(g_crop.content_layout, "Crop Box Size (%)", 10, 100, 100, lambda v: self._update_preset_key("crop_size", v))
         self.sliders_map["crop_free_width"] = self._create_slider_row(g_crop.content_layout, "Crop Free Width (%)", 10, 100, 100, lambda v: self._update_preset_key("crop_free_width", v))
@@ -583,7 +623,6 @@ class MainWindow(QMainWindow):
         self.sliders_map["exposure"] = self._create_slider_row(g_val.content_layout, "Exposure (Stops)", -200, 200, 0, lambda v: self._update_preset_key("exposure", v / 100.0))
         self.sliders_map["contrast"] = self._create_slider_row(g_val.content_layout, "Contrast", -100, 100, 0, lambda v: self._update_preset_key("contrast", v / 100.0))
         
-        # Added Whites and Blacks UI settings slider elements
         self.sliders_map["whites"] = self._create_slider_row(g_val.content_layout, "Whites", -100, 100, 0, lambda v: self._update_preset_key("whites", v / 100.0))
         self.sliders_map["blacks"] = self._create_slider_row(g_val.content_layout, "Blacks", -100, 100, 0, lambda v: self._update_preset_key("blacks", v / 100.0))
         
@@ -802,18 +841,12 @@ class MainWindow(QMainWindow):
             self.lbl_live_target_res.setText("Target Export Res: -")
             return
             
-        if self.preset.get("do_instagram_compression", True):
-            if w > 1080:
-                aspect = h / w
-                w, h = 1080, int(1080 * aspect)
-        else:
-            pct = self.preset.get("resolution_percentage", 100) / 100.0
-            w, h = int(w * pct), int(h * pct)
-            
         ratio_mode = self.preset.get("crop_aspect_ratio", "Free")
         if ratio_mode == "Free":
             box_w = int(max(10, min(100, self.preset.get("crop_free_width", 100))) / 100.0 * w)
             box_h = int(max(10, min(100, self.preset.get("crop_free_height", 100))) / 100.0 * h)
+            if self.preset.get("crop_aspect_ratio_flipped", False):
+                box_w, box_h = box_h, box_w
         else:
             if ratio_mode == "Original": target_ratio = w / h
             elif ratio_mode == "1:1": target_ratio = 1.0
@@ -822,6 +855,9 @@ class MainWindow(QMainWindow):
             elif ratio_mode == "8:10": target_ratio = 10.0 / 8.0 if w >= h else 8.0 / 10.0
             elif ratio_mode == "16:9": target_ratio = 16.0 / 9.0 if w >= h else 9.0 / 16.0
             else: target_ratio = w / h
+                
+            if self.preset.get("crop_aspect_ratio_flipped", False):
+                target_ratio = 1.0 / target_ratio
                 
             if w / h >= target_ratio:
                 max_h = h
@@ -833,17 +869,31 @@ class MainWindow(QMainWindow):
             size_scale = max(10, min(100, self.preset.get("crop_size", 100))) / 100.0
             box_w = int(max_w * size_scale)
             box_h = int(max_h * size_scale)
+
+        # Accurately query the locked pixel dimensions based on crop aspect ratio profiles
+        if self.preset.get("do_instagram_compression", True):
+            final_w = 1080
+            final_h = int(final_w * (box_h / box_w))
+        else:
+            pct = self.preset.get("resolution_percentage", 100) / 100.0
+            final_w = int(box_w * pct)
+            final_h = int(box_h * pct)
             
-        self.lbl_live_target_res.setText(f"Target Export Res: {box_w} x {box_h}")
+        self.lbl_live_target_res.setText(f"Target Export Res: {final_w} x {final_h}")
 
     def _save_current_edits_to_session_cache(self):
         if not self.current_file_path: 
             return
-        filename = os.path.basename(self.current_file_path)
-        cache_target_path = os.path.join(self.cache_directory, f"{filename}.json")
+            
+        cache_filename = self._get_cache_filename(self.current_file_path)
+        cache_target_path = os.path.join(self.cache_directory, cache_filename)
         try:
             with open(cache_target_path, "w") as f:
                 json.dump(self.preset, f, indent=2)
+            
+            if self.current_file_path not in self.edited_files:
+                self.edited_files.add(self.current_file_path)
+                self.file_model.layoutChanged.emit()
         except Exception:
             pass
 
@@ -924,16 +974,28 @@ class MainWindow(QMainWindow):
 
             self.preview_matrix = PhotoEditor.load_image_matrix(path, preview=True)
 
-            filename = os.path.basename(path)
-            cache_target_path = os.path.join(self.cache_directory, f"{filename}.json")
-            if os.path.exists(cache_target_path):
+            cache_filename = self._get_cache_filename(path)
+            cache_target_path = os.path.join(self.cache_directory, cache_filename)
+            
+            if not os.path.exists(cache_target_path):
+                old_filename = os.path.basename(path) + ".json"
+                old_cache_path = os.path.join(self.cache_directory, old_filename)
+                if os.path.exists(old_cache_path):
+                    try:
+                        with open(old_cache_path, "r") as f:
+                            self.preset = json.load(f)
+                        with open(cache_target_path, "w") as f:
+                            json.dump(self.preset, f, indent=2)
+                    except Exception:
+                        self.preset = json.loads(json.dumps(self.default_preset))
+                else:
+                    self.preset = json.loads(json.dumps(self.default_preset))
+            else:
                 try:
                     with open(cache_target_path, "r") as f:
                         self.preset = json.load(f)
                 except Exception:
                     self.preset = json.loads(json.dumps(self.default_preset))
-            else:
-                self.preset = json.loads(json.dumps(self.default_preset))
 
             self._apply_preset_to_ui()
             self._save_browsing_directory_state(os.path.dirname(path))
@@ -956,8 +1018,9 @@ class MainWindow(QMainWindow):
             self.histogram_widget.render_histogram(render_array)
             img_uint8 = (np.clip(render_array, 0.0, 1.0) * 255.0).astype(np.uint8)
         else:
-            render_array = PhotoEditor.run_pipeline(self.preview_matrix, self.preset)
-            render_array = PhotoEditor.apply_crop(render_array, self.preset)
+            # Crop framing takes precedence over structural resolution steps
+            cropped_preview = PhotoEditor.apply_crop(self.preview_matrix, self.preset)
+            render_array = PhotoEditor.run_parallel_pipeline(cropped_preview, self.preset)
             
             self.histogram_widget.render_histogram(render_array)
             img_uint8 = (np.clip(render_array, 0.0, 1.0) * 255.0).astype(np.uint8)
@@ -1009,7 +1072,6 @@ class MainWindow(QMainWindow):
         self.export_action.setEnabled(True)
         self.statusBar().showMessage(message)
         
-        # Append target key status values dynamically if calculation pipeline completes safely
         if success and self.current_file_path:
             self.exported_files.add(self.current_file_path)
             self._save_file_status_registry()
