@@ -32,27 +32,25 @@ class PhotoEditor:
         
     @staticmethod
     def load_image_matrix(image_path: str, preview: bool = False) -> np.ndarray:
-        """Loads image files into floating-point numpy structures with fast-preview overrides."""
+        """Loads image files into floating-point numpy structures with uniform color math."""
         ext = os.path.splitext(image_path)[1].lower()
 
         if ext in RAW_EXTENSIONS:
             with rawpy.imread(image_path) as raw:
-                if preview:
-                    rgb_8 = raw.postprocess(
-                        use_camera_wb=True,
-                        half_size=True,
-                        no_auto_bright=True,
-                        output_bps=8
-                    )
-                    return rgb_8.astype(np.float32) / 255.0
-                else:
-                    rgb_16 = raw.postprocess(
-                        use_camera_wb=True, 
-                        half_size=False, 
-                        no_auto_bright=True, 
-                        output_bps=16
-                    )
-                    return rgb_16.astype(np.float32) / 65535.0
+                # Always decode RAW files with identical 16-bit demosaicing and gamma spaces
+                rgb_16 = raw.postprocess(
+                    use_camera_wb=True, 
+                    half_size=False, 
+                    no_auto_bright=True, 
+                    output_bps=16
+                )
+                matrix = rgb_16.astype(np.float32) / 65535.0
+                
+                # Downsample via clean pixel interpolation ONLY after uniform demosaicing
+                if preview and matrix.shape[1] > 1200:
+                    scale = 1200.0 / matrix.shape[1]
+                    matrix = cv2.resize(matrix, (1200, int(matrix.shape[0] * scale)), interpolation=cv2.INTER_AREA)
+                return matrix
         else:
             with Image.open(image_path) as img:
                 img = ImageOps.exif_transpose(img)
@@ -133,7 +131,7 @@ class PhotoEditor:
             img += np.float32(0.5)
             np.clip(img, 0.0, 1.0, out=img)
 
-        # 5. Whites & Blacks (Dynamic Endpoint Remapping)
+        # 5. Whites & Blacks
         whites = preset.get('whites', 0.0) * v_mult
         blacks = preset.get('blacks', 0.0) * v_mult
         if whites != 0.0 or blacks != 0.0:
@@ -249,7 +247,6 @@ class PhotoEditor:
         h, w, c = src_matrix.shape
         do_instagram_compression = preset.get('do_instagram_compression', True)
 
-        # Enforce exact dynamic range optimization target dimensions cleanly
         if do_instagram_compression:
             target_w = 1080
             if w != target_w:

@@ -507,13 +507,14 @@ class MainWindow(QMainWindow):
             return
             
         try:
+            # Realign tooltips to decode identically via full 16-bit demosaicing loops
             ext = os.path.splitext(self.hover_target_path)[1].lower()
             if ext in RAW_EXTENSIONS:
                 with rawpy.imread(self.hover_target_path) as raw:
-                    rgb = raw.postprocess(use_camera_wb=True, half_size=True, no_auto_bright=True, output_bps=8)
-                    h, w, _ = rgb.shape
+                    rgb_16 = raw.postprocess(use_camera_wb=True, half_size=False, no_auto_bright=True, output_bps=16)
+                    h, w, _ = rgb_16.shape
                     scale = 320.0 / w
-                    img_small = cv2.resize(rgb, (320, int(h * scale)), interpolation=cv2.INTER_AREA)
+                    img_small = cv2.resize((rgb_16 // 256).astype(np.uint8), (320, int(h * scale)), interpolation=cv2.INTER_AREA)
             else:
                 with Image.open(self.hover_target_path) as img:
                     img.thumbnail((320, 320))
@@ -870,7 +871,6 @@ class MainWindow(QMainWindow):
             box_w = int(max_w * size_scale)
             box_h = int(max_h * size_scale)
 
-        # Accurately query the locked pixel dimensions based on crop aspect ratio profiles
         if self.preset.get("do_instagram_compression", True):
             final_w = 1080
             final_h = int(final_w * (box_h / box_w))
@@ -1018,7 +1018,6 @@ class MainWindow(QMainWindow):
             self.histogram_widget.render_histogram(render_array)
             img_uint8 = (np.clip(render_array, 0.0, 1.0) * 255.0).astype(np.uint8)
         else:
-            # Crop framing takes precedence over structural resolution steps
             cropped_preview = PhotoEditor.apply_crop(self.preview_matrix, self.preset)
             render_array = PhotoEditor.run_parallel_pipeline(cropped_preview, self.preset)
             
