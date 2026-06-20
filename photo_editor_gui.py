@@ -17,6 +17,14 @@ from typing import Dict, Any, List
 import cv2
 import numpy as np
 
+try:
+    import rawpy
+    HAS_RAWPY_GUI = True
+except ImportError:
+    HAS_RAWPY_GUI = False
+
+from PIL import Image, ImageOps
+
 from PyQt6.QtCore import Qt, QDir, QThread, pyqtSignal, QTimer, QEvent, QModelIndex
 from PyQt6.QtGui import QImage, QPixmap, QAction, QKeySequence, QFileSystemModel, QPainter, QKeyEvent, QCursor, QFont, QWheelEvent
 from PyQt6.QtWidgets import (
@@ -47,11 +55,7 @@ logging.basicConfig(
 logger = logging.getLogger("PhotoEditor.GUI")
 logger.info(f"Initialized application logging workspace output layout target: {log_file_path}")
 
-try:
-    import rawpy
-    HAS_RAWPY_GUI = True
-except ImportError:
-    HAS_RAWPY_GUI = False
+if not HAS_RAWPY_GUI:
     logger.warning("GUI running without local environment rawpy binding confirmation context.")
 
 
@@ -372,7 +376,7 @@ class MainWindow(QMainWindow):
             "crop_free_width": 100,
             "crop_free_height": 100,
             "add_white_border": False,
-            "white_border_width_pct": 5,
+            "white_border_width_pct": 2,
             "apply_temperature_adjustment": True,
             "values_multiplier": 1.0, "color_multiplier": 1.0, "color_adjustments_multiplier": 1.0,
             "hdr_compression": 0.0, "exposure": 0.0, "contrast": 0.0,
@@ -763,19 +767,19 @@ class MainWindow(QMainWindow):
                     return
                 with rawpy.imread(self.preview_target_path) as raw:
                     rgb = raw.postprocess(use_camera_wb=True, half_size=True, no_auto_bright=True, output_bps=8)
-                    img_mat = rgb
+                    
+                    # Convert to QImage mapping array safely matching dimensions
+                    h, w = rgb.shape[:2]
+                    scale = 240.0 / max(w, h)
+                    target_w, target_h = int(w * scale), int(h * scale)
+                    img_small = cv2.resize(rgb, (target_w, target_h), interpolation=cv2.INTER_AREA)
+                    img_small = np.ascontiguousarray(img_small)
             else:
-                img_mat = cv2.imread(self.preview_target_path, cv2.IMREAD_COLOR)
-                if img_mat is None:
-                    raise ValueError("OpenCV matrix read match assertion fault error layer.")
-                img_mat = cv2.cvtColor(img_mat, cv2.COLOR_BGR2RGB)
-                
-            max_dim = 240
-            h, w = img_mat.shape[:2]
-            scale = max_dim / max(w, h)
-            target_w = int(w * scale)
-            target_h = int(h * scale)
-            img_small = cv2.resize(img_mat, (target_w, target_h), interpolation=cv2.INTER_AREA)
+                # Pillow cleanly handles EXIF orientations and natively supports HEIC configurations
+                with Image.open(self.preview_target_path) as img:
+                    img = ImageOps.exif_transpose(img)
+                    img.thumbnail((240, 240))
+                    img_small = np.ascontiguousarray(img.convert('RGB'))
                 
             sh, sw, sc = img_small.shape
             q_img = QImage(img_small.data, sw, sh, sc * sw, QImage.Format.Format_RGB888)
@@ -1079,6 +1083,7 @@ class MainWindow(QMainWindow):
                     w, h = raw.sizes.width, raw.sizes.height
             else:
                 with Image.open(self.current_file_path) as img:
+                    img = ImageOps.exif_transpose(img)
                     w, h = img.size
         except Exception:
             self.lbl_live_target_res.setText("Target Export Res: -")
@@ -1216,6 +1221,7 @@ class MainWindow(QMainWindow):
                     orig_w, orig_h = raw.sizes.width, raw.sizes.height
             else:
                 with Image.open(path) as img:
+                    img = ImageOps.exif_transpose(img)
                     orig_w, orig_h = img.size
 
             self.lbl_info_name.setText(f"Name: {os.path.basename(path)}")
