@@ -10,7 +10,6 @@ import json
 import datetime
 import tempfile
 import configparser
-import shutil
 import logging
 from typing import Dict, Any, List
 
@@ -25,8 +24,8 @@ except ImportError:
 
 from PIL import Image, ImageOps
 
-from PyQt6.QtCore import Qt, QDir, QThread, pyqtSignal, QTimer, QEvent, QModelIndex
-from PyQt6.QtGui import QImage, QPixmap, QAction, QKeySequence, QFileSystemModel, QPainter, QKeyEvent, QCursor, QFont, QWheelEvent
+from PyQt6.QtCore import Qt, QDir, QThread, pyqtSignal, QTimer, QModelIndex
+from PyQt6.QtGui import QImage, QPixmap, QAction, QKeySequence, QFileSystemModel, QPainter, QKeyEvent, QFont, QIcon
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QSplitter, QTreeView, QGraphicsView, QGraphicsScene, QPushButton,
@@ -344,7 +343,18 @@ class MainWindow(QMainWindow):
     def __init__(self):
         """Prepares internal state parameters and initiates interface construction routines."""
         super().__init__()
-        self.setWindowTitle("Lightroom Pro Desktop GUI Environment")
+        # Render the camera emoji to a Pixmap since QIcon needs an image
+        icon_pixmap = QPixmap(64, 64)
+        icon_pixmap.fill(Qt.GlobalColor.transparent) # Ensure background is clear
+        
+        painter = QPainter(icon_pixmap)
+        painter.setFont(QFont("Segoe UI Emoji", 40)) # Use Windows emoji font
+        painter.drawText(icon_pixmap.rect(), 0x0004 | 0x0080, "📸") # Centered alignment
+        painter.end()
+        
+        # 3. Set the generated icon
+        QApplication.instance().setWindowIcon(QIcon(icon_pixmap))
+        self.setWindowTitle("Free Python Desktop Photo Editor by Ben Morgan")
         self.resize(1600, 950)
 
         self.current_file_path = ""

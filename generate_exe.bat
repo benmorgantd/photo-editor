@@ -1,0 +1,1 @@
+python -m PyInstaller --windowed --icon=camera_icon.ico photo_editor_gui.py
