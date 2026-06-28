@@ -354,6 +354,7 @@ class MainWindow(QMainWindow):
         self.export_thread = None
         self.copied_settings_buffer = None
         self.current_selected_folder_path = ""
+        self.is_in_browse_mode = False
 
         self.cache_directory = os.path.join(tempfile.gettempdir(), "photo_editor_session_cache")
         os.makedirs(self.cache_directory, exist_ok=True)
@@ -502,6 +503,12 @@ class MainWindow(QMainWindow):
         self.highlight_clipped_action.setCheckable(True)
         self.highlight_clipped_action.triggered.connect(self._refresh_viewport)
         tools_menu.addAction(self.highlight_clipped_action)
+
+        tools_menu.addSeparator()
+        self.toggle_browse_mode_action = QAction("&Toggle Browse Mode", self)
+        self.toggle_browse_mode_action.setCheckable(True)
+        self.toggle_browse_mode_action.triggered.connect(self._toggle_browse_mode)
+        tools_menu.addAction(self.toggle_browse_mode_action)
 
         debug_menu = menu_bar.addMenu("&Debug")
         
@@ -755,6 +762,11 @@ class MainWindow(QMainWindow):
             self._update_target_resolution_label()
             self._save_current_edits_to_session_cache()
             self._refresh_viewport()
+    
+    def _toggle_browse_mode(self):
+        """Toggles between a state where the center file loads or not"""
+        logger.info(f"Toggling Browse Mode to {int(not self.is_in_browse_mode)}")
+        self.is_in_browse_mode = not self.is_in_browse_mode
 
     def _on_tree_selection_changed(self, current: QModelIndex, previous: QModelIndex):
         """Intercepts selection adjustments in the left side tree view pane.
@@ -1236,6 +1248,13 @@ class MainWindow(QMainWindow):
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
 
         try:
+            if self.is_in_browse_mode:
+                logger.info("Exiting early because we are in browse mode")
+                return
+            
+            self.preview_matrix = PhotoEditor.load_image_matrix(path, preview=True)
+            self.preset = self._read_preset_from_manifest(path)
+
             if ext in [e.lower() for e in RAW_EXTENSIONS]:
                 if not HAS_RAWPY_GUI:
                     raise ImportError("Cannot parse targeted RAW file metadata because rawpy module is not defined.")
@@ -1255,9 +1274,6 @@ class MainWindow(QMainWindow):
             
             size_mb = os.path.getsize(path) / (1024 * 1024)
             self.lbl_info_size.setText(f"File Disk Size: {size_mb:.2f} MB")
-
-            self.preview_matrix = PhotoEditor.load_image_matrix(path, preview=True)
-            self.preset = self._read_preset_from_manifest(path)
             self._apply_preset_to_ui()
             self._save_browsing_directory_state(os.path.dirname(path))
         except Exception as e:
