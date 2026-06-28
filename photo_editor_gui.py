@@ -154,6 +154,8 @@ class CustomFileSystemModel(QFileSystemModel):
                 prefix += "⭐ "
             if path in self.main_window.exported_files:
                 suffix += " 💾"
+            if path in self.main_window.marked_files:
+                prefix += "✅ "
 
             return f"{prefix}{base_string}{suffix}"
             
@@ -361,6 +363,7 @@ class MainWindow(QMainWindow):
 
         self.starred_files = set()
         self.exported_files = set()
+        self.marked_files = set()
         self.edited_files = set()
         self._load_file_status_registry()
 
@@ -548,6 +551,7 @@ class MainWindow(QMainWindow):
                     data = json.load(f)
                     self.starred_files = set(data.get("starred_paths", []))
                     self.exported_files = set(data.get("exported_paths", []))
+                    self.marked_files = set(data.get("marked_paths", []))
             except Exception:
                 pass
 
@@ -567,7 +571,8 @@ class MainWindow(QMainWindow):
             with open(self.registry_json_path, "w") as f:
                 json.dump({
                     "starred_paths": list(self.starred_files),
-                    "exported_paths": list(self.exported_files)
+                    "exported_paths": list(self.exported_files),
+                    "marked_paths": list(self.marked_files)
                 }, f, indent=2)
         except Exception:
             pass
@@ -707,9 +712,15 @@ class MainWindow(QMainWindow):
         context_menu = QMenu(self)
         is_starred = path in self.starred_files
         
+        
         star_action = QAction("Remove Star" if is_starred else "Star Photo ⭐", self)
         star_action.triggered.connect(lambda: self._toggle_file_star(path))
         context_menu.addAction(star_action)
+
+        is_marked = path in self.marked_files
+        mark_action = QAction("Remove Mark" if is_marked else "Mark Photo ✅", self)
+        mark_action.triggered.connect(lambda: self._toggle_file_marked(path))
+        context_menu.addAction(mark_action)
         
         context_menu.exec(self.tree_view.viewport().mapToGlobal(position))
 
@@ -721,6 +732,17 @@ class MainWindow(QMainWindow):
         else:
             self.starred_files.add(path)
             logger.info(f"Registered star priority flag for active node selection: {path}")
+            
+        self._save_file_status_registry()
+        self.file_model.layoutChanged.emit()
+
+    def _toggle_file_marked(self, path: str):
+        if path in self.marked_files:
+            self.marked_files.remove(path)
+            logger.info(f"Removed asset file marked tracker registry marker: {path}")
+        else:
+            self.marked_files.add(path)
+            logger.info(f"Registered marked priority flag for active node selection: {path}")
             
         self._save_file_status_registry()
         self.file_model.layoutChanged.emit()
