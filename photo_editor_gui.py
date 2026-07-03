@@ -70,16 +70,18 @@ class ExportWorker(QThread):
     file_done_signal = pyqtSignal(int, int)  # processed, total
     finished_signal = pyqtSignal(bool, str)
 
-    def __init__(self, export_queue: List[tuple], preset_map: Dict[str, Any]):
-        """Initializes the background thread pool queue asset parameters.
-
-        Args:
-            export_queue (List[tuple]): Task items matching format (src_path, out_path, preset).
-            preset_map (Dict[str, Any]): Workspace dictionary properties snapshot references.
-        """
+    def __init__(self, export_queue: list, preset_map: dict):
+        """Initializes the background thread pool queue asset parameters."""
         super().__init__()
         self.export_queue = export_queue
         self.preset_map = preset_map
+        
+        # Thread-safe flag for cancellation
+        self._is_cancelled = False
+
+    def cancel(self):
+        """Requests the thread to halt execution at the next safe point."""
+        self._is_cancelled = True
 
     def run(self):
         """Executes background asset encoding operations looping through the job parameters."""
@@ -88,6 +90,11 @@ class ExportWorker(QThread):
         
         try:
             for idx, item in enumerate(self.export_queue):
+                # Check for cancellation at the start of each file
+                if self._is_cancelled:
+                    logger.info("User cancelled export, exiting...")
+                    break
+
                 img_path, out_path, item_preset = item
                 base_name = os.path.basename(img_path)
                 
@@ -96,11 +103,21 @@ class ExportWorker(QThread):
                 
                 full_res = PhotoEditor.load_image_matrix(img_path, preview=False)
 
+                # Check again before the next heavy operation
+                if self._is_cancelled:
+                    break
+
                 self.progress_signal.emit(f"[{idx+1}/{total_files}] Applying high-res crop dimensions for: {base_name}...")
                 cropped_full = PhotoEditor.apply_crop(full_res, item_preset)
 
+                if self._is_cancelled:
+                    break
+
                 self.progress_signal.emit(f"[{idx+1}/{total_files}] Computing multi-core tile pixel transformations...")
                 processed_full = PhotoEditor.run_parallel_pipeline(cropped_full, item_preset)
+
+                if self._is_cancelled:
+                    break
 
                 self.progress_signal.emit(f"[{idx+1}/{total_files}] Writing compressed target output JPG to disk...")
                 export_photo(processed_full, out_path, item_preset)
@@ -108,7 +125,13 @@ class ExportWorker(QThread):
                 logger.info(f"Successfully processed image output save task configuration: {out_path}")
                 self.file_done_signal.emit(idx + 1, total_files)
 
-            self.finished_signal.emit(True, f"Successfully exported {total_files} asset layers safely.")
+            # Determine how the loop ended
+            if self._is_cancelled:
+                logger.info("Batch execution aborted by user.")
+                self.finished_signal.emit(False, "Export cancelled by user.")
+            else:
+                self.finished_signal.emit(True, f"Successfully exported {total_files} asset layers safely.")
+                
         except Exception as e:
             logger.error(f"Batch execution context worker thread encountered fatal termination: {e}")
             self.finished_signal.emit(False, f"Export operation stopped due to exception: {str(e)}")
@@ -365,6 +388,7 @@ class MainWindow(QMainWindow):
         self.copied_settings_buffer = None
         self.current_selected_folder_path = ""
         self.is_in_browse_mode = False
+        self.is_export_all_variants_set = True
 
         self.cache_directory = os.path.join(tempfile.gettempdir(), "photo_editor_session_cache")
         os.makedirs(self.cache_directory, exist_ok=True)
@@ -433,10 +457,13 @@ class MainWindow(QMainWindow):
             try:
                 with open(self.manifest_json_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
+                    file_path = file_path.replace('\\', '/')
                     if file_path in data:
                         return data[file_path]
             except Exception as e:
                 logger.error(f"Failed to query central manifest database registry layout parameters: {e}")
+        
+        logger.info(f"Failed to find preset value for {file_path}, using default.")
         return json.loads(json.dumps(self.default_preset))
 
     def _write_preset_to_manifest(self, file_path: str, preset_data: dict):
@@ -520,6 +547,13 @@ class MainWindow(QMainWindow):
         self.toggle_browse_mode_action.triggered.connect(self._toggle_browse_mode)
         tools_menu.addAction(self.toggle_browse_mode_action)
 
+        tools_menu.addSeparator()
+        self.export_variants_action = QAction("&Export All Variants", self)
+        self.export_variants_action.setCheckable(True)
+        self.export_variants_action.setChecked(True)
+        self.export_variants_action.triggered.connect(self._toggle_export_variants)
+        tools_menu.addAction(self.export_variants_action)
+
         debug_menu = menu_bar.addMenu("&Debug")
         
         open_cache_action = QAction("Open Cache Folder Location Pass", self)
@@ -563,6 +597,7 @@ class MainWindow(QMainWindow):
     def _load_file_status_registry(self):
         """Parses local tracking data configurations to update view states."""
         if os.path.exists(self.registry_json_path):
+            logger.info(f"Loading file status registry from {self.registry_json_path}")
             try:
                 with open(self.registry_json_path, "r") as f:
                     data = json.load(f)
@@ -777,6 +812,11 @@ class MainWindow(QMainWindow):
         """Toggles between a state where the center file loads or not"""
         logger.info(f"Toggling Browse Mode to {int(not self.is_in_browse_mode)}")
         self.is_in_browse_mode = not self.is_in_browse_mode
+    
+    def _toggle_export_variants(self):
+        """Toggles if all variants of the photo will be exported"""
+        logger.info(f"Toggling export all variants to {not self.is_export_all_variants_set}")
+        self.is_export_all_variants_set = not self.is_export_all_variants_set
 
     def _on_tree_selection_changed(self, current: QModelIndex, previous: QModelIndex):
         """Intercepts selection adjustments in the left side tree view pane.
@@ -1337,6 +1377,8 @@ class MainWindow(QMainWindow):
         if not self.current_file_path:
             self.statusBar().showMessage("Export failure: No active file target data mapping available.")
             return
+        
+        self._save_current_edits_to_session_cache()
 
         suggested_dir = os.path.join(os.path.dirname(self.current_file_path), "edits")
         os.makedirs(suggested_dir, exist_ok=True)
@@ -1346,8 +1388,28 @@ class MainWindow(QMainWindow):
         out_path, _ = QFileDialog.getSaveFileName(self, "Export Production Clean Photo Matrix Asset", default_out, "JPEG Image Map (*.jpg)")
         if not out_path: return
 
-        queue = [(self.current_file_path, out_path, json.loads(json.dumps(self.preset)))]
+        queue = [(self.current_file_path, out_path, json.loads(json.dumps(self._read_preset_from_manifest(self.current_file_path))))]
+
+        if self.is_export_all_variants_set:
+            queue.append(self._get_export_variants(self.current_file_path, out_path, self.preset))
+
         self._execute_progressive_export_queue(queue)
+    
+    def _get_export_variants(self, current_file_path, out_path, preset):
+        """Get the export variant data for the given file so we can add it to the queue"""
+
+        logger.info(f"Exporting all jpeg and framing variants for {current_file_path}")
+        
+        # No frame and uncompressed
+        preset_copy = json.loads(json.dumps(preset))
+        # Set white border and instagram compression off
+        preset_copy['do_instagram_compression'] = False
+        preset_copy['add_white_border'] = False
+        out_path_dir = os.path.dirname(out_path)
+        out_path_orig_name, ext = os.path.splitext(os.path.basename(out_path))
+        variant_path = os.path.join(out_path_dir, out_path_orig_name + '_v_noframe_uncompressed' + ext)
+
+        return (current_file_path, variant_path, preset_copy)
 
     def _trigger_batch_starred_export(self):
         """Assembles folder collection files tracking active star records into batch job blocks."""
@@ -1357,20 +1419,21 @@ class MainWindow(QMainWindow):
 
         logger.info(f"Scanning target location folder for starred references: {self.current_selected_folder_path}")
         starred_in_folder = []
-        
+        norm_starred_files = [os.path.normpath(f) for f in self.starred_files]
+
         try:
             for item in os.listdir(self.current_selected_folder_path):
-                full_item_path = os.path.join(self.current_selected_folder_path, item)
-                if os.path.isfile(full_item_path) and full_item_path in self.starred_files:
-                    ext = os.path.splitext(full_item_path)[1].lower()
+                norm_full_item_path = os.path.normpath(os.path.join(self.current_selected_folder_path, item))
+                if os.path.isfile(norm_full_item_path) and norm_full_item_path in norm_starred_files:
+                    ext = os.path.splitext(norm_full_item_path)[1].lower()
                     if ext in SUPPORTED_EXTENSIONS:
-                        starred_in_folder.append(full_item_path)
+                        starred_in_folder.append(norm_full_item_path)
         except Exception as ex:
             logger.error(f"Failed to scan folder contents: {ex}")
             return
 
         if not starred_in_folder:
-            QMessageBox.information(self, "Zero Starred Images Found", f"No starred photo markers match items inside:\n{os.path.basename(self.current_selected_folder_path)}")
+            QMessageBox.information(self, "Zero Starred Images Found", f"No starred photo markers match items inside:\n\"{os.path.basename(self.current_selected_folder_path)}\"")
             return
 
         output_dir = os.path.join(self.current_selected_folder_path, "starred_edits")
@@ -1382,6 +1445,9 @@ class MainWindow(QMainWindow):
             base_name = os.path.splitext(os.path.basename(img_path))[0]
             out_path = os.path.join(output_dir, f"{base_name}_starred_edit.jpg")
             queue.append((img_path, out_path, item_preset))
+
+            if self.is_export_all_variants_set:
+                queue.append(self._get_export_variants(img_path, out_path, item_preset))
 
         logger.info(f"Queued batch collection assembly done. Count: {len(queue)}")
         self._execute_progressive_export_queue(queue)
@@ -1404,9 +1470,12 @@ class MainWindow(QMainWindow):
         self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
         self.progress_dialog.setMinimumWidth(550)
         self.progress_dialog.setValue(0)
-        self.progress_dialog.show()
+        
 
         self.export_thread = ExportWorker(queue, self.preset)
+        self.progress_dialog.canceled.connect(self.export_thread.cancel)
+
+        self.progress_dialog.show()
         self.export_thread.progress_signal.connect(self.progress_dialog.setLabelText)
         
         def handle_progress_step(done, total):
