@@ -11,7 +11,7 @@ import datetime
 import tempfile
 import configparser
 import logging
-from typing import Dict, Any, List
+from typing import Any, List
 
 import cv2
 import numpy as np
@@ -25,7 +25,7 @@ except ImportError:
 from PIL import Image, ImageOps
 
 from PyQt6.QtCore import Qt, QDir, QThread, pyqtSignal, QTimer, QModelIndex
-from PyQt6.QtGui import QImage, QPixmap, QAction, QKeySequence, QFileSystemModel, QPainter, QKeyEvent, QFont, QIcon
+from PyQt6.QtGui import QImage, QPixmap, QAction, QKeySequence, QFileSystemModel, QPainter, QKeyEvent, QFont, QIcon, QColor, QBrush
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QSplitter, QTreeView, QGraphicsView, QGraphicsScene, QPushButton,
@@ -189,6 +189,11 @@ class CustomFileSystemModel(QFileSystemModel):
                     font = QFont()
                 font.setItalic(True)
                 return font
+        
+        if role == Qt.ItemDataRole.ForegroundRole:
+            path = self.filePath(index)
+            if path not in self.main_window.edited_files:
+                return QBrush(QColor(Qt.GlobalColor.gray))
                 
         return super().data(index, role)
 
@@ -817,7 +822,7 @@ class MainWindow(QMainWindow):
         """Toggles if all variants of the photo will be exported"""
         logger.info(f"Toggling export all variants to {not self.is_export_all_variants_set}")
         self.is_export_all_variants_set = not self.is_export_all_variants_set
-
+    
     def _on_tree_selection_changed(self, current: QModelIndex, previous: QModelIndex):
         """Intercepts selection adjustments in the left side tree view pane.
 
