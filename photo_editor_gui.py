@@ -334,6 +334,8 @@ class CollapsibleGroupBox(QGroupBox):
 class ZoomableGraphicsView(QGraphicsView):
     """Viewport container supporting mouse wheel zooming and click-and-drag panning."""
 
+    ZOOM_SENSITIVITY = 0.05
+
     def __init__(self, parent=None):
         """Constructs viewport parameters matching interactive scene controls.
 
@@ -354,9 +356,18 @@ class ZoomableGraphicsView(QGraphicsView):
         Args:
             event (QWheelEvent): Input location angle parameter wrapper blocks.
         """
-        zoom_factor = 1.15 if event.angleDelta().y() > 0 else 0.85
+        zoom_factor = (1 + self.ZOOM_SENSITIVITY) if event.angleDelta().y() > 0 else (1 - self.ZOOM_SENSITIVITY)
         self.scale(zoom_factor, zoom_factor)
-
+    
+    def zoom_to_fit(self):
+        if not self.scene():
+            return
+        
+        scene_rect = self.scene().sceneRect()
+        if scene_rect.isNull():
+            return
+        
+        self.fitInView(scene_rect, Qt.AspectRatioMode.KeepAspectRatio)
 
 class MainWindow(QMainWindow):
     """Main window object orchestrates user interface layout structures.
@@ -572,6 +583,11 @@ class MainWindow(QMainWindow):
         purge_cache_action = QAction("Purge Session Cache Files Completely", self)
         purge_cache_action.triggered.connect(self._debug_purge_cache_files)
         debug_menu.addAction(purge_cache_action)
+
+        view_menu = menu_bar.addMenu('&View')
+        reset_view_action = QAction('Reset View', self)
+        reset_view_action.triggered.connect(self._zoom_to_fit)
+        view_menu.addAction(reset_view_action)
 
     def _copy_edit_settings(self):
         """Copies the current preset settings to an internal clipboard buffer or triggers native text copy."""
@@ -1376,6 +1392,10 @@ class MainWindow(QMainWindow):
         self.scene.clear()
         self.scene.addPixmap(pixmap)
         self.scene.setSceneRect(0, 0, w, h)
+        self.view.zoom_to_fit()
+    
+    def _zoom_to_fit(self):
+        self.view.zoom_to_fit()
 
     def _trigger_file_export(self):
         """Prepares single file queue requests to push into the multi-core background worker thread."""
