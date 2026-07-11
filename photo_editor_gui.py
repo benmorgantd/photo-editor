@@ -54,9 +54,23 @@ logging.basicConfig(
 logger = logging.getLogger("PhotoEditor.GUI")
 logger.info(f"Initialized application logging workspace output layout target: {log_file_path}")
 
+def global_exception_handler(exc_type, exc_value, exc_traceback):
+    # Allow standard Ctrl+C keyboard interrupts to kill the process normally
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+
+    # Log the crash with the full traceback
+    logger.critical("Uncaught exception occurred:", exc_info=(exc_type, exc_value, exc_traceback))
+
+# Bind the custom handler to Python's global exception hook
+sys.excepthook = global_exception_handler
+
 if not HAS_RAWPY_GUI:
     logger.warning("GUI running without local environment rawpy binding confirmation context.")
 
+# TODO: we moved where crop and border, resolution information gets stored so we have to look for that elsewhere. 
+# We would do that by pulling it instead from the current crop variant instead of flatly from the preset. 
 
 class ExportWorker(QThread):
     """Background worker thread executing heavy matrix transformations and disk I/O.
@@ -419,18 +433,6 @@ class MainWindow(QMainWindow):
         self._load_file_status_registry()
 
         self.default_preset = {
-            "do_instagram_compression": True,
-            "resolution_percentage": 100,
-            "crop_aspect_ratio": "Free",
-            "crop_aspect_ratio_flipped": False,
-            "crop_rotation": 0,
-            "crop_size": 100,
-            "crop_center_x": 50,
-            "crop_center_y": 50,
-            "crop_free_width": 100,
-            "crop_free_height": 100,
-            "add_white_border": False,
-            "white_border_width_pct": 2,
             "apply_temperature_adjustment": True,
             "values_multiplier": 1.0, "color_multiplier": 1.0, "color_adjustments_multiplier": 1.0,
             "hdr_compression": 0.0, "exposure": 0.0, "contrast": 0.0,
@@ -443,6 +445,22 @@ class MainWindow(QMainWindow):
                 "yellow": {"hue": 0.0, "sat": 0.0}, "green": {"hue": 0.0, "sat": 0.0},
                 "aqua": {"hue": 0.0, "sat": 0.0}, "blue": {"hue": 0.0, "sat": 0.0},
                 "purple": {"hue": 0.0, "sat": 0.0}, "magenta": {"hue": 0.0, "sat": 0.0}
+            },
+            "crop_variants" : {
+                "default": {
+                    "crop_aspect_ratio": "Free",
+                    "crop_aspect_ratio_flipped": False,
+                    "crop_rotation": 0,
+                    "crop_size": 100,
+                    "crop_center_x": 50,
+                    "crop_center_y": 50,
+                    "crop_free_width": 100,
+                    "crop_free_height": 100,
+                    "add_white_border": True,
+                    "white_border_width_pct": 2,
+                    "resolution_percentage": 100,
+                    "do_instagram_compression": True
+                }
             }
         }
         self.preset = json.loads(json.dumps(self.default_preset))
@@ -460,6 +478,10 @@ class MainWindow(QMainWindow):
         self.showMaximized()
         logger.info("Main photo editor workspace frame initialization lifecycle complete.")
 
+    @property
+    def active_crop_variant(self):
+        return self.preset['crop_variants'][self.preset['active_crop_variant']]
+    
     def _read_preset_from_manifest(self, file_path: str) -> dict:
         """Queries the consolidated database file using absolute path strings as keys.
 
@@ -822,8 +844,8 @@ class MainWindow(QMainWindow):
 
     def _toggle_aspect_ratio_flip(self):
         """Inverts the active bounding box aspect ratio horizontally vs vertically."""
-        is_flipped = self.preset.get("crop_aspect_ratio_flipped", False)
-        self.preset["crop_aspect_ratio_flipped"] = not is_flipped
+        is_flipped = self.active_crop_variant.get("crop_aspect_ratio_flipped", False)
+        self.active_crop_variant["crop_aspect_ratio_flipped"] = not is_flipped
         if not self.is_updating_ui:
             self._update_target_resolution_label()
             self._save_current_edits_to_session_cache()
@@ -1122,20 +1144,20 @@ class MainWindow(QMainWindow):
     def _apply_preset_to_ui(self):
         """Maps parameters sequentially across GUI element items, blocking nested validation loops."""
         self.is_updating_ui = True
-        self.cb_instagram.setChecked(self.preset.get("do_instagram_compression", True))
+        self.cb_instagram.setChecked(self.active_crop_variant.get("do_instagram_compression", True))
         self.cb_apply_temp.setChecked(self.preset.get("apply_temperature_adjustment", True))
 
-        self.crop_ratio_combo.setCurrentText(self.preset.get("crop_aspect_ratio", "Free"))
-        self.cb_white_border.setChecked(self.preset.get("add_white_border", False))
+        self.crop_ratio_combo.setCurrentText(self.active_crop_variant.get("crop_aspect_ratio", "Free"))
+        self.cb_white_border.setChecked(self.active_crop_variant.get("add_white_border", False))
 
-        self.sliders_map["resolution_percentage"].setValue(int(self.preset.get("resolution_percentage", 100)))
-        self.sliders_map["crop_rotation"].setValue(int(self.preset.get("crop_rotation", 0)))
-        self.sliders_map["crop_size"].setValue(int(self.preset.get("crop_size", 100)))
-        self.sliders_map["crop_free_width"].setValue(int(self.preset.get("crop_free_width", 100)))
-        self.sliders_map["crop_free_height"].setValue(int(self.preset.get("crop_free_height", 100)))
-        self.sliders_map["crop_center_x"].setValue(int(self.preset.get("crop_center_x", 50)))
-        self.sliders_map["crop_center_y"].setValue(int(self.preset.get("crop_center_y", 50)))
-        self.sliders_map["white_border_width_pct"].setValue(int(self.preset.get("white_border_width_pct", 5)))
+        self.sliders_map["resolution_percentage"].setValue(int(self.active_crop_variant.get("resolution_percentage", 100)))
+        self.sliders_map["crop_rotation"].setValue(int(self.active_crop_variant.get("crop_rotation", 0)))
+        self.sliders_map["crop_size"].setValue(int(self.active_crop_variant.get("crop_size", 100)))
+        self.sliders_map["crop_free_width"].setValue(int(self.active_crop_variant.get("crop_free_width", 100)))
+        self.sliders_map["crop_free_height"].setValue(int(self.active_crop_variant.get("crop_free_height", 100)))
+        self.sliders_map["crop_center_x"].setValue(int(self.active_crop_variant.get("crop_center_x", 50)))
+        self.sliders_map["crop_center_y"].setValue(int(self.active_crop_variant.get("crop_center_y", 50)))
+        self.sliders_map["white_border_width_pct"].setValue(int(self.active_crop_variant.get("white_border_width_pct", 5)))
 
         self.sliders_map["values_multiplier"].setValue(int(self.preset.get("values_multiplier", 1.0) * 100))
         self.sliders_map["color_multiplier"].setValue(int(self.preset.get("color_multiplier", 1.0) * 100))
@@ -1194,11 +1216,11 @@ class MainWindow(QMainWindow):
             self.lbl_live_target_res.setText("Target Export Res: -")
             return
             
-        ratio_mode = self.preset.get("crop_aspect_ratio", "Free")
+        ratio_mode = self.active_crop_variant.get("crop_aspect_ratio", "Free")
         if ratio_mode == "Free":
             box_w = int(max(10, min(100, self.preset.get("crop_free_width", 100))) / 100.0 * w)
             box_h = int(max(10, min(100, self.preset.get("crop_free_height", 100))) / 100.0 * h)
-            if self.preset.get("crop_aspect_ratio_flipped", False):
+            if self.active_crop_variant.get("crop_aspect_ratio_flipped", False):
                 box_w, box_h = box_h, box_w
         else:
             if ratio_mode == "Original": target_ratio = w / h
@@ -1209,7 +1231,7 @@ class MainWindow(QMainWindow):
             elif ratio_mode == "16:9": target_ratio = 16.0 / 9.0 if w >= h else 9.0 / 16.0
             else: target_ratio = w / h
                 
-            if self.preset.get("crop_aspect_ratio_flipped", False):
+            if self.active_crop_variant.get("crop_aspect_ratio_flipped", False):
                 target_ratio = 1.0 / target_ratio
                 
             if w / h >= target_ratio:
@@ -1223,7 +1245,7 @@ class MainWindow(QMainWindow):
             box_w = int(max_w * size_scale)
             box_h = int(max_h * size_scale)
 
-        if self.preset.get("do_instagram_compression", True):
+        if self.active_crop_variant.get("do_instagram_compression", True):
             final_w = 1080
             final_h = int(final_w * (box_h / box_w))
         else:
@@ -1243,7 +1265,8 @@ class MainWindow(QMainWindow):
                 self.file_model.layoutChanged.emit()
         except Exception:
             pass
-
+    
+    # TODO: with crop variants, make way to add \ remove them in the ui and make sure their values save and are editable
     def _update_preset_key(self, key: str, value: Any):
         """Updates targeted tracking parameter metrics inside global configurations.
 
@@ -1251,7 +1274,11 @@ class MainWindow(QMainWindow):
             key (str): Key matching requested modification slots.
             value (Any): Payload setting values configuration attributes.
         """
-        self.preset[key] = value
+        # TODO: if the key is part of the crop keys. This is making it more complex
+        if key in self.preset['crop_variants']['default']:
+            self.preset['crop_variants'][self.preset['active_crop_variant']][key] = value
+        else:
+            self.preset[key] = value
         if not self.is_updating_ui:
             self._update_target_resolution_label()
             self._save_current_edits_to_session_cache()
@@ -1416,7 +1443,7 @@ class MainWindow(QMainWindow):
         queue = [(self.current_file_path, out_path, json.loads(json.dumps(self._read_preset_from_manifest(self.current_file_path))))]
 
         if self.is_export_all_variants_set:
-            queue.append(self._get_export_variants(self.current_file_path, out_path, self.preset))
+            queue += self._get_export_variants(self.current_file_path, out_path, self.preset)
 
         self._execute_progressive_export_queue(queue)
     
@@ -1424,17 +1451,36 @@ class MainWindow(QMainWindow):
         """Get the export variant data for the given file so we can add it to the queue"""
 
         logger.info(f"Exporting all jpeg and framing variants for {current_file_path}")
-        
-        # No frame and uncompressed
-        preset_copy = json.loads(json.dumps(preset))
-        # Set white border and instagram compression off
-        preset_copy['do_instagram_compression'] = False
-        preset_copy['add_white_border'] = False
+
+        result = []
+
         out_path_dir = os.path.dirname(out_path)
         out_path_orig_name, ext = os.path.splitext(os.path.basename(out_path))
-        variant_path = os.path.join(out_path_dir, out_path_orig_name + '_v_noframe_uncompressed' + ext)
 
-        return (current_file_path, variant_path, preset_copy)
+        # No frame and uncompressed
+        for crop_variant_name, crop_data in preset['crop_variants'].items():
+            preset_copy = json.loads(json.dumps(preset))
+
+            # All we have to do to get it to export this is to change the active variant
+            preset_copy['active_crop_variant'] = crop_variant_name
+            variant_path = os.path.join(out_path_dir, out_path_orig_name + f'_v_crop_{crop_variant_name}' + ext)
+
+            result.append((current_file_path, variant_path, preset_copy))
+            
+            # TODO: if it has a border or compression, also create a borderless version here
+        
+        return result
+
+        # if preset_copy['do_instagram_compression']
+
+        # # Set white border and instagram compression off
+        # preset_copy['do_instagram_compression'] = False
+        # preset_copy['add_white_border'] = False
+        # out_path_dir = os.path.dirname(out_path)
+        # out_path_orig_name, ext = os.path.splitext(os.path.basename(out_path))
+        # variant_path = os.path.join(out_path_dir, out_path_orig_name + '_v_noframe_uncompressed' + ext)
+
+        # return (current_file_path, variant_path, preset_copy)
 
     def _trigger_batch_starred_export(self):
         """Assembles folder collection files tracking active star records into batch job blocks."""

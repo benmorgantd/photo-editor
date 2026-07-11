@@ -9,6 +9,9 @@ import argparse
 import json
 import os
 import sys
+
+
+
 import logging
 from typing import Dict, Any, List
 from concurrent.futures import ThreadPoolExecutor
@@ -24,6 +27,18 @@ try:
     logger.info("Successfully registered pillow_heif decoder extension layout.")
 except Exception as env_ex:
     logger.warning(f"pillow_heif extension disabled via system application control rule policy: {env_ex}")
+
+def global_exception_handler(exc_type, exc_value, exc_traceback):
+    # Allow standard Ctrl+C keyboard interrupts to kill the process normally
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+
+    # Log the crash with the full traceback
+    logger.critical("Uncaught exception occurred:", exc_info=(exc_type, exc_value, exc_traceback))
+
+# Bind the custom handler to Python's global exception hook
+sys.excepthook = global_exception_handler
 
 try:
     import rawpy
@@ -110,30 +125,52 @@ class PhotoEditor:
                 raise e
 
     @staticmethod
-    def _apply_aces_tonemap(img: np.ndarray, intensity: float) -> np.ndarray:
-        """Applies an approximation of the ACES film tonemapping curve to compress dynamic range.
-
-        Args:
-            img (np.ndarray): High precision source image matrix layer.
-            intensity (float): Blending factor slider value between 0.0 and 1.0.
-
-        Returns:
-            np.ndarray: Compressed floating-point RGB matrix.
+    def _apply_sdr_preview(img: np.ndarray, intensity: float) -> np.ndarray:
         """
-        if intensity <= 0.0:
-            return img
+        Compresses HDR data into an SDR range (0.0 to 1.0), simulating Lightroom's 
+        'Preview for SDR Display'.
+        
+        Args:
+            img (np.ndarray): High precision source image (can contain values > 1.0).
+            intensity (float): 0.0 represents standard SDR clipping (no HDR compression).
+                               1.0 represents full ACES highlight roll-off.
+        
+        Returns:
+            np.ndarray: Bounded SDR image matrix in range [0.0, 1.0].
+        """
+        # Clamp intensity to valid range
+        intensity = float(np.clip(intensity, 0.0, 1.0))
+        
+        if intensity == 0.0:
+            # At 0 intensity, simulate standard SDR display clipping without tonemapping
+            return np.clip(img, 0.0, 1.0).astype(np.float32)
 
+        # Narkowicz ACES approximation coefficients
         a = np.float32(2.51)
         b = np.float32(0.03)
         c = np.float32(2.43)
         d = np.float32(0.59)
         e = np.float32(0.14)
 
-        scaled_img = img * np.float32(1.0 + intensity * 1.5)
-        tonemapped = (scaled_img * (a * scaled_img + b)) / (scaled_img * (c * scaled_img + d) + e)
+        # Apply ACES curve directly without artificial exposure pre-scaling
+        tonemapped = (img * (a * img + b)) / (img * (c * img + d) + e)
+        
+        # Ensure mathematical precision errors don't drift outside [0, 1]
         np.clip(tonemapped, 0.0, 1.0, out=tonemapped)
 
-        return cv2.addWeighted(tonemapped, float(intensity), img, float(1.0 - intensity), 0).astype(np.float32)
+        if intensity == 1.0:
+            return tonemapped.astype(np.float32)
+
+        # Blend between standard SDR clipping and full ACES compression.
+        # Unlike blending with raw HDR, both inputs here are strictly <= 1.0, 
+        # guaranteeing the output never blows out on an SDR display.
+        sdr_clipped = np.clip(img, 0.0, 1.0)
+        
+        return cv2.addWeighted(
+            tonemapped, intensity, 
+            sdr_clipped, 1.0 - intensity, 
+            0.0
+        ).astype(np.float32)
 
     @classmethod
     def run_pipeline(cls, src_matrix: np.ndarray, preset: Dict[str, Any]) -> np.ndarray:
@@ -147,164 +184,208 @@ class PhotoEditor:
             np.ndarray: Fully processed floating-point RGB matrix layout.
         """
         img = np.copy(src_matrix).astype(np.float32)
+        h, w, _ = img.shape
+        max_dim = max(h, w)
 
         v_mult = np.clip(preset.get('values_multiplier', 1.0), 0.0, 1.0)
         c_mult = np.clip(preset.get('color_multiplier', 1.0), 0.0, 1.0)
         ca_mult = np.clip(preset.get('color_adjustments_multiplier', 1.0), 0.0, 1.0)
 
-        hdr_comp = preset.get('hdr_compression', 0.0)
-        if hdr_comp > 0.0:
-            img = cls._apply_aces_tonemap(img, hdr_comp)
-
+        # 1. White Balance (Temperature & Tint via Multiplicative Gain)
         apply_temp = preset.get('apply_temperature_adjustment', True)
         temp_kelvin = preset.get('temp_kelvin', 6500.0)
         tint = preset.get('tint', 0.0)  
         
         if apply_temp and temp_kelvin != 6500.0:
             if temp_kelvin > 6500.0:
-                clipped_kelvin = min(temp_kelvin, 12000.0)
-                temp_factor = (clipped_kelvin - 6500.0) / (12000.0 - 6500.0)
+                temp_factor = min(temp_kelvin - 6500.0, 5500.0) / 5500.0
+                img[:, :, 0] *= np.float32(1.0 + temp_factor * 0.25)
+                img[:, :, 2] *= np.float32(1.0 - temp_factor * 0.20)
             else:
-                clipped_kelvin = max(temp_kelvin, 2000.0)
-                temp_factor = (clipped_kelvin - 6500.0) / (6500.0 - 2000.0)
-            
-            img[:, :, 0] += np.float32(temp_factor * 0.1)  
-            img[:, :, 2] -= np.float32(temp_factor * 0.1)  
+                temp_factor = max(6500.0 - temp_kelvin, 4500.0) / 4500.0
+                img[:, :, 2] *= np.float32(1.0 + temp_factor * 0.30)
+                img[:, :, 0] *= np.float32(1.0 - temp_factor * 0.15)
 
         if tint != 0.0:
-            img[:, :, 1] += np.float32(tint * 0.05)
-            img[:, :, 0] += np.float32(tint * 0.025)
-            img[:, :, 2] += np.float32(tint * 0.025)
+            img[:, :, 1] *= np.float32(1.0 + tint * 0.15)
 
-        np.clip(img, 0.0, 1.0, out=img)
-
+        # 2. Exposure (1 EV = 2x multiplier)
         exposure = preset.get('exposure', 0.0)
         if exposure != 0.0:
             img *= np.float32(2.0 ** exposure)
-            np.clip(img, 0.0, 1.0, out=img)
 
+        # 3. Contrast (Pivot around middle gray 0.18)
         contrast = preset.get('contrast', 0.0) * v_mult
         if contrast != 0.0:
-            img -= np.float32(0.5)
-            img *= np.float32(1.0 + contrast)
-            img += np.float32(0.5)
-            np.clip(img, 0.0, 1.0, out=img)
+            pivot = np.float32(0.18) 
+            img = (img - pivot) * np.float32(1.0 + contrast) + pivot
+            img = np.maximum(img, np.float32(0.0))
 
+        # 4. Whites & Blacks (Soft shoulder/toe)
         whites = preset.get('whites', 0.0) * v_mult
         blacks = preset.get('blacks', 0.0) * v_mult
+        
         if whites != 0.0 or blacks != 0.0:
-            w_thr = np.float32(1.0 - (whites * 0.15))
-            b_thr = np.float32(0.0 - (blacks * 0.15))
-            if w_thr <= b_thr:
-                w_thr = b_thr + np.float32(0.01)
-            img = (img - b_thr) / (w_thr - b_thr)
-            np.clip(img, 0.0, 1.0, out=img)
+            lum = np.float32(0.2126) * img[:, :, 0] + np.float32(0.7152) * img[:, :, 1] + np.float32(0.0722) * img[:, :, 2]
+            lum_safe = np.maximum(lum, np.float32(1e-6))
+            new_lum = lum.copy()
 
+            if whites != 0.0:
+                w_mask = np.clip((lum - np.float32(0.5)) * np.float32(2.0), 0.0, 1.0)
+                new_lum += (whites * np.float32(0.25)) * (w_mask ** 2) * lum
+
+            if blacks != 0.0:
+                b_mask = np.clip((np.float32(0.3) - lum) * np.float32(3.33), 0.0, 1.0)
+                new_lum += (blacks * np.float32(0.15)) * (b_mask ** 2)
+
+            img *= np.expand_dims(new_lum / lum_safe, axis=2)
+
+        # 5. Highlights & Shadows
         highlights = preset.get('highlights', 0.0) * v_mult
         shadows = preset.get('shadows', 0.0) * v_mult
 
         if highlights != 0.0 or shadows != 0.0:
-            luminance = np.float32(0.299) * img[:, :, 0] + np.float32(0.587) * img[:, :, 1] + np.float32(0.114) * img[:, :, 2]
-            luminance = np.expand_dims(luminance, axis=2)
+            lum = np.float32(0.2126) * img[:, :, 0] + np.float32(0.7152) * img[:, :, 1] + np.float32(0.0722) * img[:, :, 2]
+            lum_safe = np.maximum(lum, np.float32(1e-6))
+            new_lum = lum.copy()
 
             if highlights != 0.0:
-                hl_mask = np.power(luminance, 2)
-                img += (np.float32(highlights) * hl_mask * (np.float32(1.0) - img) * np.float32(0.5))
+                hl_range = np.clip((lum - np.float32(0.5)) * np.float32(2.0), 0.0, 1.0)
+                hl_mask = hl_range * hl_range * (np.float32(3.0) - np.float32(2.0) * hl_range)
+                if highlights < 0.0:
+                    new_lum *= (np.float32(1.0) + (highlights * hl_mask * np.float32(0.5)))
+                else:
+                    safe_headroom = np.maximum(np.float32(0.0), np.float32(1.0) - lum)
+                    new_lum += highlights * hl_mask * safe_headroom * np.float32(0.7)
 
             if shadows != 0.0:
-                sh_mask = np.power(np.float32(1.0) - luminance, 2)
-                img += (np.float32(shadows) * sh_mask * img * np.float32(0.5))
-            
-            np.clip(img, 0.0, 1.0, out=img)
+                sh_range = np.clip((np.float32(0.5) - lum) * np.float32(2.0), 0.0, 1.0)
+                sh_mask = sh_range * sh_range * (np.float32(3.0) - np.float32(2.0) * sh_range)
+                if shadows > 0.0:
+                    new_lum += shadows * sh_mask * (np.sqrt(lum_safe) - lum) * np.float32(0.8)
+                else:
+                    new_lum *= (np.float32(1.0) + (shadows * sh_mask * np.float32(0.5)))
 
+            img *= np.expand_dims(new_lum / lum_safe, axis=2)
+        
+        # 6. Texture (High-Frequency Local Detail - Dynamic Kernel Scaling)
         texture = preset.get('texture', 0.0)
         if texture != 0.0:
-            low_pass = cv2.GaussianBlur(img, (5, 5), 0)
-            img += (np.float32(texture) * (img - low_pass) * np.float32(0.4))
+            t_k = max(3, int(max_dim * 0.005) | 1)
+            low_pass_tex = cv2.GaussianBlur(img, (t_k, t_k), 0)
+            high_freq = img - low_pass_tex
+            img += np.float32(texture * 0.5) * high_freq
 
+        # 7. Clarity (Mid-Frequency Local Contrast - Dynamic Wide Kernel)
         clarity = preset.get('clarity', 0.0)
         if clarity != 0.0:
-            h, w, _ = img.shape
-            sf = 4
-            target_w = max(16, w // sf)
-            target_h = max(16, h // sf)
-            small_img = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_AREA)
-            k_size_w = max(3, (target_w // 8) | 1)
-            k_size_h = max(3, (target_h // 8) | 1)
-            small_blur = cv2.GaussianBlur(small_img, (k_size_w, k_size_h), 0)
-            large_blur = cv2.resize(small_blur, (w, h), interpolation=cv2.INTER_LINEAR)
-            img += (np.float32(clarity) * (img - large_blur) * np.float32(0.3))
+            c_k = max(5, int(max_dim * 0.05) | 1)
+            low_pass_clarity = cv2.GaussianBlur(img, (c_k, c_k), 0)
+            mid_freq = img - low_pass_clarity
+            img += np.float32(clarity * 0.4) * mid_freq
 
-        np.clip(img, 0.0, 1.0, out=img)
+        # 8. Saturation & Vibrance (HDR-Compatible Grayscale Interpolation)
+        vibrance = preset.get('vibrance', 0.0) * c_mult
+        saturation = preset.get('saturation', 0.0) * c_mult
+        
+        if saturation != 0.0 or vibrance != 0.0:
+            lum_matrix = (np.float32(0.2126) * img[:, :, 0] + 
+                          np.float32(0.7152) * img[:, :, 1] + 
+                          np.float32(0.0722) * img[:, :, 2])
+            grayscale = np.expand_dims(lum_matrix, axis=2)
+            
+            if vibrance != 0.0:
+                max_rgb = np.max(img, axis=2, keepdims=True)
+                min_rgb = np.min(img, axis=2, keepdims=True)
+                sat_mask = np.where(max_rgb > 1e-5, (max_rgb - min_rgb) / max_rgb, np.float32(0.0))
+                vib_factor = np.float32(vibrance) * (np.float32(1.0) - sat_mask)
+                img = grayscale + (img - grayscale) * (np.float32(1.0) + vib_factor)
 
+            if saturation != 0.0:
+                sat_factor = np.maximum(np.float32(1.0 + saturation), np.float32(0.0))
+                img = grayscale + (img - grayscale) * sat_factor
+
+        # 9. 8-Band Color Adjustments (Luminance-Preserved HDR Chroma Mapping)
+        color_adj = preset.get('color_adjustments', {})
+        if color_adj and ca_mult > 0.0:
+            # Save original unbounded HDR luminance to prevent highlight clipping during HSV math
+            orig_lum = (np.float32(0.2126) * img[:, :, 0] + 
+                        np.float32(0.7152) * img[:, :, 1] + 
+                        np.float32(0.0722) * img[:, :, 2])
+            orig_lum_safe = np.maximum(orig_lum, np.float32(1e-6))
+
+            # Normalize to [0, 1] purely for safe OpenCV HSV conversion
+            safe_rgb = np.clip(img, 0.0, 1.0)
+            hsv = cv2.cvtColor(safe_rgb, cv2.COLOR_RGB2HSV)
+            
+            bands_config = {
+                'red': {'center': 0.0, 'width': 22.0},
+                'orange': {'center': 30.0, 'width': 15.0},
+                'yellow': {'center': 60.0, 'width': 20.0},
+                'green': {'center': 120.0, 'width': 40.0},
+                'aqua': {'center': 175.0, 'width': 25.0},
+                'blue': {'center': 225.0, 'width': 35.0},
+                'purple': {'center': 275.0, 'width': 25.0},
+                'magenta': {'center': 315.0, 'width': 25.0}
+            }
+
+            h_matrix = hsv[:, :, 0]
+            s_matrix = hsv[:, :, 1]
+            total_h_delta = np.zeros_like(h_matrix)
+            total_s_mod = np.zeros_like(s_matrix)
+            has_adjustments = False
+
+            for band, cfg in bands_config.items():
+                adjustments = color_adj.get(band, {"hue": 0.0, "sat": 0.0})
+                h_shift = float(adjustments.get('hue', 0.0) * 180.0 * ca_mult)
+                s_shift = float(adjustments.get('sat', 0.0) * ca_mult)
+
+                if h_shift == 0.0 and s_shift == 0.0:
+                    continue
+                
+                has_adjustments = True
+                diff = np.abs(h_matrix - cfg['center'])
+                diff = np.minimum(diff, 360.0 - diff)
+                weight = np.clip(1.0 - (diff / cfg['width']), 0.0, 1.0)
+                weight = 0.5 * (1.0 - np.cos(weight * np.pi))
+
+                if h_shift != 0.0:
+                    total_h_delta += (weight * h_shift)
+                if s_shift != 0.0:
+                    total_s_mod += (weight * s_shift)
+
+            if has_adjustments:
+                hsv[:, :, 0] = (hsv[:, :, 0] + total_h_delta) % 360.0
+                pos_mask = (total_s_mod >= 0.0)
+                neg_mask = ~pos_mask
+                
+                s_matrix[pos_mask] = s_matrix[pos_mask] * (1.0 + total_s_mod[pos_mask]) + (total_s_mod[pos_mask] * 0.2)
+                s_matrix[neg_mask] = s_matrix[neg_mask] * (1.0 + total_s_mod[neg_mask])
+                hsv[:, :, 1] = np.clip(s_matrix, 0.0, 1.0)
+
+                # Convert back to RGB and scale by original HDR luminance ratio!
+                new_rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB).astype(np.float32)
+                new_lum = (np.float32(0.2126) * new_rgb[:, :, 0] + 
+                           np.float32(0.7152) * new_rgb[:, :, 1] + 
+                           np.float32(0.0722) * new_rgb[:, :, 2])
+                new_lum_safe = np.maximum(new_lum, np.float32(1e-6))
+                
+                img = new_rgb * np.expand_dims(orig_lum / new_lum_safe, axis=2)
+
+        # 10. Optional Smoothing
         blur_radius = preset.get('gaussian_blur', 0.0)
         if blur_radius > 0:
             sigma = float(blur_radius * 1.5)
             img = cv2.GaussianBlur(img, (0, 0), sigmaX=sigma, sigmaY=sigma)
 
-        hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
+        # 11. Display Preparation: Tonemapping at the end of float processing
+        hdr_comp = preset.get('hdr_compression', 0.0)
+        if hdr_comp > 0.0:
+            img = cls._apply_sdr_preview(img, hdr_comp)
 
-        vibrance = preset.get('vibrance', 0.0) * c_mult
-        if vibrance != 0.0:
-            hsv[:, :, 1] *= (np.float32(1.0) + np.float32(vibrance) * (np.float32(1.0) - hsv[:, :, 1]))
-
-        saturation = preset.get('saturation', 0.0) * c_mult
-        if saturation != 0.0:
-            hsv[:, :, 1] *= (np.float32(1.0) + np.float32(saturation))
-
-        bands_config = {
-            'red': {'center': 0.0, 'width': 22.0},
-            'orange': {'center': 30.0, 'width': 15.0},
-            'yellow': {'center': 60.0, 'width': 20.0},
-            'green': {'center': 120.0, 'width': 40.0},
-            'aqua': {'center': 175.0, 'width': 25.0},
-            'blue': {'center': 225.0, 'width': 35.0},
-            'purple': {'center': 275.0, 'width': 25.0},
-            'magenta': {'center': 315.0, 'width': 25.0}
-        }
-
-        color_adj = preset.get('color_adjustments', {})
-        h_matrix = hsv[:, :, 0]
-        s_matrix = hsv[:, :, 1]
-
-        total_h_delta = np.zeros_like(h_matrix)
-        total_s_mod = np.zeros_like(s_matrix)
-        has_adjustments = False
-
-        for band, cfg in bands_config.items():
-            adjustments = color_adj.get(band, {"hue": 0.0, "sat": 0.0})
-            h_shift = float(adjustments.get('hue', 0.0) * 180.0 * ca_mult)
-            s_shift = float(adjustments.get('sat', 0.0) * ca_mult)
-
-            if h_shift == 0.0 and s_shift == 0.0:
-                continue
-            
-            has_adjustments = True
-            center = cfg['center']
-            width = cfg['width']
-
-            diff = np.abs(h_matrix - center)
-            diff = np.minimum(diff, 360.0 - diff)
-
-            weight = np.clip(1.0 - (diff / width), 0.0, 1.0)
-            weight = 0.5 * (1.0 - np.cos(weight * np.pi))
-
-            if h_shift != 0.0:
-                total_h_delta += (weight * h_shift)
-            if s_shift != 0.0:
-                total_s_mod += (weight * s_shift)
-
-        if has_adjustments:
-            hsv[:, :, 0] = (hsv[:, :, 0] + total_h_delta) % 360.0
-            pos_mask = (total_s_mod >= 0.0)
-            neg_mask = ~pos_mask
-            
-            s_matrix[pos_mask] = s_matrix[pos_mask] * (1.0 + total_s_mod[pos_mask]) + (total_s_mod[pos_mask] * 0.2)
-            s_matrix[neg_mask] = s_matrix[neg_mask] * (1.0 + total_s_mod[neg_mask])
-            hsv[:, :, 1] = np.clip(s_matrix, 0.0, 1.0)
-
-        final_rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
-        return np.clip(final_rgb, 0.0, 1.0).astype(np.float32)
+        # 12. Final In-Place Hard Clip to SDR Monitor Bounds [0.0, 1.0]
+        np.clip(img, 0.0, 1.0, out=img)
+        return img
 
     @classmethod
     def run_parallel_pipeline(cls, src_matrix: np.ndarray, preset: Dict[str, Any]) -> np.ndarray:
@@ -318,7 +399,9 @@ class PhotoEditor:
             np.ndarray: Multi-core rendered full raster color grid matrix output.
         """
         h, w, c = src_matrix.shape
-        do_instagram_compression = preset.get('do_instagram_compression', True)
+        active_crop_variant = preset.get('active_crop_variant', 'default')
+        crop_variant_data = preset.get(active_crop_variant, dict())
+        do_instagram_compression = crop_variant_data.get('do_instagram_compression', True)
 
         if do_instagram_compression:
             target_w = 1080
@@ -326,7 +409,7 @@ class PhotoEditor:
                 aspect_ratio = h / w
                 src_matrix = cv2.resize(src_matrix, (target_w, int(target_w * aspect_ratio)), interpolation=cv2.INTER_LANCZOS4)
         else:
-            pct = int(preset.get('resolution_percentage', 100)) / 100.0
+            pct = int(crop_variant_data.get('resolution_percentage', 100)) / 100.0
             if pct < 1.0:
                 src_matrix = cv2.resize(src_matrix, (int(w * pct), int(h * pct)), interpolation=cv2.INTER_LANCZOS4)
         
@@ -359,30 +442,30 @@ class PhotoEditor:
         return output_matrix
 
     @staticmethod
-    def apply_crop(img: np.ndarray, preset: Dict[str, Any]) -> np.ndarray:
+    def apply_crop(img: np.ndarray, crop_data: Dict[str, Any]) -> np.ndarray:
         """Applies center rotation skew corrections and slices image bounding boxes.
 
         Args:
             img (np.ndarray): High precision source image matrix layout.
-            preset (Dict[str, Any]): Dictionary containing configuration presets.
+            crop_data (Dict[str, Any]): Dictionary containing crop data.
 
         Returns:
             np.ndarray: Cropped and modified bounding box sub-matrix configuration.
         """
         h, w, _ = img.shape
         
-        rotation = float(preset.get('crop_rotation', 0.0))
+        rotation = float(crop_data.get('crop_rotation', 0.0))
         if rotation != 0.0:
             M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), rotation, 1.0)
             fill_color = (0.0, 0.0, 0.0) if img.dtype == np.float32 else (0, 0, 0)
             img = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_CONSTANT, borderValue=fill_color)
             
-        ratio_mode = preset.get('crop_aspect_ratio', 'Free')
+        ratio_mode = crop_data.get('crop_aspect_ratio', 'Free')
         
         if ratio_mode == 'Free':
-            box_w = int(max(10, min(100, preset.get('crop_free_width', 100))) / 100.0 * w)
-            box_h = int(max(10, min(100, preset.get('crop_free_height', 100))) / 100.0 * h)
-            if preset.get('crop_aspect_ratio_flipped', False):
+            box_w = int(max(10, min(100, crop_data.get('crop_free_width', 100))) / 100.0 * w)
+            box_h = int(max(10, min(100, crop_data.get('crop_free_height', 100))) / 100.0 * h)
+            if crop_data.get('crop_aspect_ratio_flipped', False):
                 box_w, box_h = box_h, box_w
         else:
             if ratio_mode == 'Original': target_ratio = w / h
@@ -393,7 +476,7 @@ class PhotoEditor:
             elif ratio_mode == '16:9': target_ratio = 16.0 / 9.0 if w >= h else 9.0 / 16.0
             else: target_ratio = w / h
                 
-            if preset.get('crop_aspect_ratio_flipped', False):
+            if crop_data.get('crop_aspect_ratio_flipped', False):
                 target_ratio = 1.0 / target_ratio
                 
             if w / h >= target_ratio:
@@ -403,12 +486,12 @@ class PhotoEditor:
                 max_w = w
                 max_h = int(w / target_ratio)
                 
-            size_scale = max(10, min(100, preset.get('crop_size', 100))) / 100.0
+            size_scale = max(10, min(100, crop_data.get('crop_size', 100))) / 100.0
             box_w = int(max_w * size_scale)
             box_h = int(max_h * size_scale)
             
-        cx_pct = preset.get('crop_center_x', 50) / 100.0
-        cy_pct = preset.get('crop_center_y', 50) / 100.0
+        cx_pct = crop_data.get('crop_center_x', 50) / 100.0
+        cy_pct = crop_data.get('crop_center_y', 50) / 100.0
         
         ideal_cx = int(cx_pct * w)
         ideal_cy = int(cy_pct * h)
@@ -442,10 +525,13 @@ class PhotoEditor:
         Returns:
             np.ndarray: Modified bounded border canvas matrix configuration layer.
         """
-        if not preset.get('add_white_border', False):
+        current_crop_variant = preset.get("active_crop_variant", "default")
+        crop_data = preset["crop_variants"].get(current_crop_variant, dict())
+
+        if not crop_data.get('add_white_border', False):
             return img
         h, w, _ = img.shape
-        border_pct = preset.get('white_border_width_pct', 5)
+        border_pct = crop_data.get('white_border_width_pct', 5)
         border_pixels = int(max(w, h) * (border_pct / 100.0))
         
         if border_pixels > 0 and w > 2 * border_pixels and h > 2 * border_pixels:
@@ -468,7 +554,11 @@ class PhotoEditor:
         Returns:
             np.ndarray: Rendered image matrix.
         """
-        cropped = self.apply_crop(self.original_image, preset)
+
+        current_crop_variant = preset.get("active_crop_variant", "default")
+        crop_data = preset["crop_variants"].get(current_crop_variant)
+
+        cropped = self.apply_crop(self.original_image, crop_data)
         return self.run_parallel_pipeline(cropped, preset)
 
 
@@ -482,6 +572,9 @@ def export_photo(img_array: np.ndarray, output_path: str, preset: Dict[str, Any]
         max_mb (float, optional): Maximum compressed file boundary. Defaults to 8.0.
     """
     final_img_array = (np.clip(img_array, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+    active_crop_variant = preset.get('active_crop_variant', 'default')
+    crop_variant_data = preset.get(active_crop_variant, dict())
     
     grain = preset.get('grain', 0.0)
     grain_size = preset.get('grain_size', 1.0)
@@ -494,12 +587,12 @@ def export_photo(img_array: np.ndarray, output_path: str, preset: Dict[str, Any]
             noise = cv2.resize(noise, (fw, fh), interpolation=cv2.INTER_LINEAR)
         final_img_array = np.clip(final_img_array.astype(np.float32) + noise, 0, 255).astype(np.uint8)
 
-    if preset.get('add_white_border', False):
+    if crop_variant_data.get('add_white_border', False):
         final_img_array = PhotoEditor.apply_white_border(final_img_array, preset)
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     img_pil = Image.fromarray(final_img_array)
-    do_instagram_compression = preset.get('do_instagram_compression', True)
+    do_instagram_compression = crop_variant_data.get('do_instagram_compression', True)
 
     if do_instagram_compression:
         quality = 95
