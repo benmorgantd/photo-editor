@@ -608,6 +608,7 @@ class MainWindow(QMainWindow):
 
         view_menu = menu_bar.addMenu('&View')
         reset_view_action = QAction('Reset View', self)
+        reset_view_action.setShortcut(QKeySequence("F"))
         reset_view_action.triggered.connect(self._zoom_to_fit)
         view_menu.addAction(reset_view_action)
 
@@ -1400,7 +1401,7 @@ class MainWindow(QMainWindow):
             self.histogram_widget.render_histogram(render_array)
             img_uint8 = (np.clip(render_array, 0.0, 1.0) * 255.0).astype(np.uint8)
         else:
-            cropped_preview = PhotoEditor.apply_crop(self.preview_matrix, self.preset)
+            cropped_preview = PhotoEditor.apply_crop(self.preview_matrix, self.active_crop_variant)
             render_array = PhotoEditor.run_parallel_pipeline(cropped_preview, self.preset)
             self.histogram_widget.render_histogram(render_array)
             img_uint8 = (np.clip(render_array, 0.0, 1.0) * 255.0).astype(np.uint8)
