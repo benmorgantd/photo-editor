@@ -61,6 +61,39 @@ class PhotoEditor:
         original_image (np.ndarray): High-precision floating-point source image matrix.
     """
 
+    DEFAULT_PRESET = {
+            "apply_temperature_adjustment": True,
+            "values_multiplier": 1.0, "color_multiplier": 1.0, "color_adjustments_multiplier": 1.0,
+            "hdr_compression": 0.0, "exposure": 0.0, "contrast": 0.0,
+            "whites": 0.0, "blacks": 0.0,
+            "highlights": 0.0, "shadows": 0.0, "texture": 0.0, "clarity": 0.0,
+            "gaussian_blur": 0.0, "vibrance": 0.0, "saturation": 0.0, "grain": 0.0, "grain_size": 1.0,
+            "temp_kelvin": 6500, "tint": 0.0,
+            "color_adjustments": {
+                "red": {"hue": 0.0, "sat": 0.0}, "orange": {"hue": 0.0, "sat": 0.0},
+                "yellow": {"hue": 0.0, "sat": 0.0}, "green": {"hue": 0.0, "sat": 0.0},
+                "aqua": {"hue": 0.0, "sat": 0.0}, "blue": {"hue": 0.0, "sat": 0.0},
+                "purple": {"hue": 0.0, "sat": 0.0}, "magenta": {"hue": 0.0, "sat": 0.0}
+            },
+            "active_crop_variant" : "default",
+            "crop_variants" : {
+                "default": {
+                    "crop_aspect_ratio": "Free",
+                    "crop_aspect_ratio_flipped": False,
+                    "crop_rotation": 0,
+                    "crop_size": 100,
+                    "crop_center_x": 50,
+                    "crop_center_y": 50,
+                    "crop_free_width": 100,
+                    "crop_free_height": 100,
+                    "add_white_border": True,
+                    "white_border_width_pct": 2,
+                    "resolution_percentage": 100,
+                    "do_instagram_compression": True
+                }
+            }
+        }
+
     def __init__(self, image_path: str):
         """Initializes the PhotoEditor instance by reading the image matrix into memory.
 
@@ -544,6 +577,143 @@ class PhotoEditor:
                 cv2.BORDER_CONSTANT, value=fill_val
             )
         return img
+
+    @classmethod
+    def calculate_auto_preset(cls, img: np.ndarray, is_linear: bool = True) -> Dict[str, Any]:
+        """
+        Analyzes an image histogram and chrominance distribution to generate 
+        objective, professional starting-point slider adjustments.
+        
+        Args:
+            img (np.ndarray): Floating-point RGB source image.
+            is_linear (bool): True if data is in linear light, False if sRGB/gamma.
+            preset          : Preset dict
+            
+        Returns:
+            Dict[str, Any]: Recommended slider values to feed into your preset dictionary.
+        """
+        # Work on a downscaled copy for lightning-fast analysis (~0.005 seconds)
+        h, w, _ = img.shape
+        scale = min(1.0, 1024.0 / max(h, w))
+        # rurn calculation on hdr compressed image
+        img = PhotoEditor._apply_sdr_preview(img, 1.0)
+        small = cv2.resize(img, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        
+        # Calculate Rec.709 Luminance
+        lum = (np.float32(0.2126) * small[:, :, 0] + 
+               np.float32(0.7152) * small[:, :, 1] + 
+               np.float32(0.0722) * small[:, :, 2])
+        lum_safe = np.maximum(lum, np.float32(1e-6))
+
+        # ==========================================
+        # 1. AUTO-EXPOSURE (Middle-Gray Anchoring)
+        # ==========================================
+        # Linear middle gray is ~0.18. sRGB middle gray is ~0.42.
+        target_median = np.float32(0.18) if is_linear else np.float32(0.42)
+        
+        # Calculate median only from non-extreme pixels to ignore pitch black or direct sun
+        valid_lum = lum[(lum > 0.01) & (lum < 2.0)]
+        current_median = np.median(valid_lum) if len(valid_lum) > 0 else target_median
+        
+        # EV shift equation: log2(target / current)
+        ev_shift = float(np.log2(target_median / max(current_median, 1e-4)))
+        # Clamp exposure recommendation to sane photographic limits (-2.5 to +2.5 EV)
+        auto_exposure = float(np.clip(ev_shift * 0.8, -2.5, 2.5)) # 0.8 relaxation factor prevents over-correction
+
+        # ==========================================
+        # 2. AUTO-TONAL RECOVERY (Histogram Tails)
+        # ==========================================
+        # Predict luminance *after* auto-exposure is applied
+        predicted_lum = lum * (2.0 ** auto_exposure)
+        
+        p02 = np.percentile(predicted_lum, 2)
+        p98 = np.percentile(predicted_lum, 98)
+        
+        # If highlights break 0.90, progressively pull highlights slider negative
+        auto_highlights = 0.0
+        if p98 > 0.90:
+            auto_highlights = float(np.clip((0.90 - p98) * 1.5, -1.0, 0.0))
+            
+        # If shadows drop below 0.06, progressively push shadows slider positive
+        auto_shadows = 0.0
+        if p02 < 0.06:
+            auto_shadows = float(np.clip((0.06 - p02) * 10.0, 0.0, 1.0))
+
+        # ==========================================
+        # 3. AUTO WHITE BALANCE (Neutral Patch Detection)
+        # ==========================================
+        # Isolate unsaturated midtone pixels (the "grays" in the image)
+        max_c = np.max(small, axis=2)
+        min_c = np.min(small, axis=2)
+        sat = np.where(max_c > 1e-5, (max_c - min_c) / max_c, 0.0)
+        
+        # Neutral candidates: Saturation < 20%, Luminance between 10% and 80%
+        neutral_mask = (sat < 0.20) & (lum > 0.10) & (lum < 0.80)
+        
+        auto_kelvin = 6500.0
+        auto_tint = 0.0
+        
+        if np.sum(neutral_mask) > 100: # Ensure we have enough sample pixels
+            mean_r = np.mean(small[:, :, 0][neutral_mask])
+            mean_g = np.mean(small[:, :, 1][neutral_mask])
+            mean_z = np.mean(small[:, :, 2][neutral_mask]) # Blue
+            
+            # Calculate Red/Blue ratio deviation from neutral 1:1
+            rb_ratio = mean_r / max(mean_z, 1e-5)
+            # Map ratio to Kelvin shift (empirical linear approximation)
+            if rb_ratio > 1.05: # Image is warm/yellowish -> recommend cooler Kelvin
+                auto_kelvin = float(np.clip(6500.0 - (rb_ratio - 1.0) * 4000.0, 3200.0, 6500.0))
+            elif rb_ratio < 0.95: # Image is cool/bluish -> recommend warmer Kelvin
+                auto_kelvin = float(np.clip(6500.0 + (1.0 - rb_ratio) * 5000.0, 6500.0, 9500.0))
+                
+            # Calculate Green vs Magenta axis (Tint)
+            rg_ratio = mean_g / max((mean_r + mean_z) * 0.5, 1e-5)
+            auto_tint = float(np.clip((1.0 - rg_ratio) * 2.0, -0.5, 0.5))
+
+        # ==========================================
+        # 4. CONTENT HEURISTICS (Grass & Skin Tones)
+        # ==========================================
+        # Convert to HSV to detect foliage and protect skin
+        hsv = cv2.cvtColor(np.clip(small, 0.0, 1.0), cv2.COLOR_RGB2HSV)
+        hue = hsv[:, :, 0] # 0 to 360 in standard float format
+        
+        # Foliage detection: Hue between 80 and 140
+        grass_mask = (hue >= 80.0) & (hue <= 140.0) & (sat > 0.15) & (lum > 0.05)
+        grass_ratio = np.sum(grass_mask) / hsv.shape[0] / hsv.shape[1]
+        
+        green_sat_boost = 0.0
+        if grass_ratio > 0.05: # If more than 5% of the image is grass/trees
+            green_sat_boost = float(np.clip(grass_ratio * 0.5, 0.0, 0.25))
+
+        # Assemble and return the complete auto-preset dictionary!
+        adjustments = {
+            "exposure": round(auto_exposure, 2),
+            "contrast": 0.05, # Micro-bump for punch
+            "highlights": round(auto_highlights, 2),
+            "shadows": round(auto_shadows, 2),
+            "temp_kelvin": round(auto_kelvin, -1), # Round to nearest 10 Kelvin
+            "tint": round(auto_tint, 2),
+            "vibrance": 0.15, # Safe universal vibrance boost
+            "saturation": 0.0,
+            "color_adjustments": {
+                "green": {"hue": 0.0, "sat": round(green_sat_boost, 2)},
+                # Lock orange sat boost to 0.0 to automatically safeguard human skin tones!
+                "orange": {"hue": 0.0, "sat": 0.0} 
+            },
+            "hdr_compression" : 1.0
+        }
+
+        result = PhotoEditor.DEFAULT_PRESET.copy()
+
+        for key, value in adjustments.items():
+            if isinstance(value, dict):
+                for _k, _v in value.items():
+                    result[key][_k] = _v
+            else:
+                result[key] = value
+        
+        return result
+
 
     def apply_presets(self, preset: Dict[str, Any]) -> np.ndarray:
         """Unified instance abstraction method executing the full pipeline pass.

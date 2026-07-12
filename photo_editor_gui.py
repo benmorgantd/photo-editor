@@ -432,37 +432,7 @@ class MainWindow(QMainWindow):
         self.edited_files = set()
         self._load_file_status_registry()
 
-        self.default_preset = {
-            "apply_temperature_adjustment": True,
-            "values_multiplier": 1.0, "color_multiplier": 1.0, "color_adjustments_multiplier": 1.0,
-            "hdr_compression": 0.0, "exposure": 0.0, "contrast": 0.0,
-            "whites": 0.0, "blacks": 0.0,
-            "highlights": 0.0, "shadows": 0.0, "texture": 0.0, "clarity": 0.0,
-            "gaussian_blur": 0.0, "vibrance": 0.0, "saturation": 0.0, "grain": 0.0, "grain_size": 1.0,
-            "temp_kelvin": 6500, "tint": 0.0,
-            "color_adjustments": {
-                "red": {"hue": 0.0, "sat": 0.0}, "orange": {"hue": 0.0, "sat": 0.0},
-                "yellow": {"hue": 0.0, "sat": 0.0}, "green": {"hue": 0.0, "sat": 0.0},
-                "aqua": {"hue": 0.0, "sat": 0.0}, "blue": {"hue": 0.0, "sat": 0.0},
-                "purple": {"hue": 0.0, "sat": 0.0}, "magenta": {"hue": 0.0, "sat": 0.0}
-            },
-            "crop_variants" : {
-                "default": {
-                    "crop_aspect_ratio": "Free",
-                    "crop_aspect_ratio_flipped": False,
-                    "crop_rotation": 0,
-                    "crop_size": 100,
-                    "crop_center_x": 50,
-                    "crop_center_y": 50,
-                    "crop_free_width": 100,
-                    "crop_free_height": 100,
-                    "add_white_border": True,
-                    "white_border_width_pct": 2,
-                    "resolution_percentage": 100,
-                    "do_instagram_compression": True
-                }
-            }
-        }
+        self.default_preset = PhotoEditor.DEFAULT_PRESET
         self.preset = json.loads(json.dumps(self.default_preset))
         self.sliders_map = {}
 
@@ -591,6 +561,11 @@ class MainWindow(QMainWindow):
         self.export_variants_action.setChecked(True)
         self.export_variants_action.triggered.connect(self._toggle_export_variants)
         tools_menu.addAction(self.export_variants_action)
+
+        tools_menu.addSeparator()
+        self.apply_auto_edit_action = QAction('&Apply Auto Edits', self)
+        self.apply_auto_edit_action.triggered.connect(self._apply_auto_edits)
+        tools_menu.addAction(self.apply_auto_edit_action)
 
         debug_menu = menu_bar.addMenu("&Debug")
         
@@ -861,6 +836,15 @@ class MainWindow(QMainWindow):
         """Toggles if all variants of the photo will be exported"""
         logger.info(f"Toggling export all variants to {not self.is_export_all_variants_set}")
         self.is_export_all_variants_set = not self.is_export_all_variants_set
+
+    def _apply_auto_edits(self):
+        '''Applies the auto edit calculation to the image'''
+        logger.info('Apply auto edits')
+        _result = PhotoEditor.calculate_auto_preset(self.preview_matrix)
+        self.preset = _result.copy()
+        print(self.preset)
+        self._apply_preset_to_ui()
+        self._save_current_edits_to_session_cache()
     
     def _on_tree_selection_changed(self, current: QModelIndex, previous: QModelIndex):
         """Intercepts selection adjustments in the left side tree view pane.
@@ -1285,6 +1269,7 @@ class MainWindow(QMainWindow):
             self._save_current_edits_to_session_cache()
             self._refresh_viewport()
 
+    # TODO: we could do the same for crop with "nested preset"
     def _update_nested_color_preset(self, band: str, prop: str, value: float):
         """Modifies targeted spectral value slots inside isolated sub-dictionaries.
 
