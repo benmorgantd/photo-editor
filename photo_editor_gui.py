@@ -450,7 +450,11 @@ class MainWindow(QMainWindow):
 
     @property
     def active_crop_variant(self):
-        return self.preset['crop_variants'][self.preset['active_crop_variant']]
+        crop_variants = self.preset.get('crop_variants', dict())
+        print(crop_variants)  # dict(str, dict)
+        active_variant = self.preset.get('active_crop_variant', 'default')
+        print(active_variant) 
+        return crop_variants.get(active_variant, PhotoEditor.DEFAULT_PRESET['crop_variants']['default'])
     
     def _read_preset_from_manifest(self, file_path: str) -> dict:
         """Queries the consolidated database file using absolute path strings as keys.
@@ -565,6 +569,7 @@ class MainWindow(QMainWindow):
         tools_menu.addSeparator()
         self.apply_auto_edit_action = QAction('&Apply Auto Edits', self)
         self.apply_auto_edit_action.triggered.connect(self._apply_auto_edits)
+        self.apply_auto_edit_action.setShortcut(QKeySequence("1"))
         tools_menu.addAction(self.apply_auto_edit_action)
 
         debug_menu = menu_bar.addMenu("&Debug")
@@ -840,9 +845,12 @@ class MainWindow(QMainWindow):
     def _apply_auto_edits(self):
         '''Applies the auto edit calculation to the image'''
         logger.info('Applying auto edits')
+        print(self.preset)
         auto_edit_results = PhotoEditor.calculate_auto_preset(self.preview_matrix)
 
-        # TODO: going back to the default preset will remove all existing cropping from the image
+        _prev_active_crop_variant = self.preset.get('active_crop_variant', 'default')
+        _prev_crop_variants = self.preset.get('crop_variants', PhotoEditor.DEFAULT_PRESET['crop_variants'])
+
         self.preset = PhotoEditor.DEFAULT_PRESET.copy()
 
         for key, value in auto_edit_results.items():
@@ -852,6 +860,11 @@ class MainWindow(QMainWindow):
                     self.preset[key][_k] = _v
             else:
                 self.preset[key] = value
+        
+        # restore previous crop data
+        self.preset['active_crop_variant'] = _prev_active_crop_variant
+        self.preset['crop_variants'] = _prev_crop_variants
+
         self._apply_preset_to_ui()
         self._save_current_edits_to_session_cache()
     
