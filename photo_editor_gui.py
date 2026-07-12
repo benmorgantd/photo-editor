@@ -4,6 +4,7 @@ Provides standard dialog windows, automated workspace batch queues, active monit
 histograms, and synchronized local execution logging routines.
 """
 
+import time
 import sys
 import os
 import json
@@ -466,6 +467,7 @@ class MainWindow(QMainWindow):
         Returns:
             dict: Preset mapping configuration properties.
         """
+        start = time.time()
         if os.path.exists(self.manifest_json_path):
             try:
                 with open(self.manifest_json_path, "r", encoding="utf-8") as f:
@@ -477,7 +479,9 @@ class MainWindow(QMainWindow):
                 logger.error(f"Failed to query central manifest database registry layout parameters: {e}")
         
         logger.info(f"Failed to find preset value for {file_path}, using default.")
-        return json.loads(json.dumps(self.default_preset))
+        result = json.loads(json.dumps(self.default_preset))
+        print(f'Time to read json preset: {time.time() - start}')
+        return result
 
     def _write_preset_to_manifest(self, file_path: str, preset_data: dict):
         """Persists the updated metadata preset block inside the single manifest archive file.
@@ -486,6 +490,7 @@ class MainWindow(QMainWindow):
             file_path (str): Direct image location key value.
             preset_data (dict): Snapshotted parameters data metrics layout maps.
         """
+        start = time.time()
         data = {}
         if os.path.exists(self.manifest_json_path):
             try:
@@ -500,6 +505,7 @@ class MainWindow(QMainWindow):
                 json.dump(data, f, indent=2, ensure_ascii=False)
         except Exception as e:
             logger.error(f"Manifest database disk serialization write fault exception error: {e}")
+        print(f'Time to write preset: {time.time() - start}')
 
     def _init_menu_bar(self):
         """Assembles parent layout level drop-down action lists on the main toolbar shell."""
