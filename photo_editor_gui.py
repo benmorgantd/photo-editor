@@ -839,10 +839,19 @@ class MainWindow(QMainWindow):
 
     def _apply_auto_edits(self):
         '''Applies the auto edit calculation to the image'''
-        logger.info('Apply auto edits')
-        _result = PhotoEditor.calculate_auto_preset(self.preview_matrix)
-        self.preset = _result.copy()
-        print(self.preset)
+        logger.info('Applying auto edits')
+        auto_edit_results = PhotoEditor.calculate_auto_preset(self.preview_matrix)
+
+        # TODO: going back to the default preset will remove all existing cropping from the image
+        self.preset = PhotoEditor.DEFAULT_PRESET.copy()
+
+        for key, value in auto_edit_results.items():
+            print(key, value)
+            if isinstance(value, dict):
+                for _k, _v in value.items():
+                    self.preset[key][_k] = _v
+            else:
+                self.preset[key] = value
         self._apply_preset_to_ui()
         self._save_current_edits_to_session_cache()
     
