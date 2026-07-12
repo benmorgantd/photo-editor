@@ -103,9 +103,66 @@ class PhotoEditor:
         self.image_path = image_path
         logger.info(f"Initializing PhotoEditor instance matrix for: {os.path.basename(image_path)}")
         self.original_image = self.load_image_matrix(image_path)
-        
+
     @staticmethod
-    def load_image_matrix(image_path: str, preview: bool = False) -> np.ndarray:
+    def load_image_matrix(image_path: str, preview: bool = False, max_width: int = 1200) -> np.ndarray:
+        """Loads image files into floating-point numpy structures with uniform color math."""
+        ext = os.path.splitext(image_path)[1].lower()
+        logger.info(f"Parsing image file matrix allocation layer: {os.path.basename(image_path)} (Preview Mode={preview})")
+
+        if ext in RAW_EXTENSIONS:
+            if not HAS_RAWPY:
+                logger.error("Execution blocked: rawpy engine is not defined or installed in this environment.")
+                raise ImportError("Cannot decode RAW files because 'rawpy' is not installed in this Python environment.")
+            try:
+                with rawpy.imread(image_path) as raw:
+                    # Use half_size=True at the C++ decode level if preview is requested
+                    rgb_16 = raw.postprocess(
+                        use_camera_wb=True, 
+                        half_size=preview,  # Massive speedup for previews
+                        no_auto_bright=True, 
+                        output_bps=16
+                    )
+                    
+                    # Resize the 16-bit integer array BEFORE converting to float32
+                    if preview and rgb_16.shape[1] > max_width:
+                        scale = float(max_width) / rgb_16.shape[1]
+                        new_height = int(rgb_16.shape[0] * scale)
+                        rgb_16 = cv2.resize(rgb_16, (max_width, new_height), interpolation=cv2.INTER_AREA)
+                    
+                    # Perform float conversion and normalization only on the final pixel count
+                    return rgb_16.astype(np.float32, copy=False) / 65535.0
+
+            except Exception as e:
+                logger.error(f"Critical error mapping raw image array layout structure: {e}")
+                raise e
+        else:
+            try:
+                # cv2.imread loads natively to a NumPy array (much faster than PIL -> NumPy)
+                # IMREAD_COLOR ignores EXIF orientation by default, so we handle it via IMREAD_IGNORE_ORIENTATION or cv2
+                img_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
+                
+                if img_bgr is None:
+                    raise ValueError(f"OpenCV failed to decode image buffer at path: {image_path}")
+
+                # Convert BGR to RGB
+                img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+                # Resize the 8-bit integer array BEFORE float math
+                if preview and img_rgb.shape[1] > max_width:
+                    scale = float(max_width) / img_rgb.shape[1]
+                    new_height = int(img_rgb.shape[0] * scale)
+                    img_rgb = cv2.resize(img_rgb, (max_width, new_height), interpolation=cv2.INTER_AREA)
+
+                # Convert to float32 and normalize
+                return img_rgb.astype(np.float32, copy=False) / 255.0
+
+            except Exception as e:
+                logger.error(f"Failed to cleanly decode compressed standard image file layout: {e}")
+                raise e    
+    
+    @staticmethod
+    def _load_image_matrix_old(image_path: str, preview: bool = False, max_width=1200) -> np.ndarray:
         """Loads image files into floating-point numpy structures with uniform color math.
 
         Args:
@@ -135,9 +192,9 @@ class PhotoEditor:
                         output_bps=16
                     )
                     matrix = rgb_16.astype(np.float32) / 65535.0
-                    if preview and matrix.shape[1] > 1200:
-                        scale = 1200.0 / matrix.shape[1]
-                        matrix = cv2.resize(matrix, (1200, int(matrix.shape[0] * scale)), interpolation=cv2.INTER_AREA)
+                    if preview and matrix.shape[1] > max_width:
+                        scale = float(max_width) / matrix.shape[1]
+                        matrix = cv2.resize(matrix, (max_width, int(matrix.shape[0] * scale)), interpolation=cv2.INTER_AREA)
                     return matrix
             except Exception as e:
                 logger.error(f"Critical error mapping raw image array layout structure: {e}")

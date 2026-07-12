@@ -843,6 +843,7 @@ class MainWindow(QMainWindow):
         """Toggles between a state where the center file loads or not"""
         logger.info(f"Toggling Browse Mode to {int(not self.is_in_browse_mode)}")
         self.is_in_browse_mode = not self.is_in_browse_mode
+        self._refresh_viewport()
     
     def _toggle_export_variants(self):
         """Toggles if all variants of the photo will be exported"""
@@ -1397,7 +1398,7 @@ class MainWindow(QMainWindow):
                 logger.info("Exiting early because we are in browse mode")
                 return
             
-            self.preview_matrix = PhotoEditor.load_image_matrix(path, preview=True)
+            self.preview_matrix = PhotoEditor.load_image_matrix(path, preview=True)  # this takes the most time, 5 sec
             self.preset = self._read_preset_from_manifest(path)
 
             if ext in [e.lower() for e in RAW_EXTENSIONS]:
@@ -1517,17 +1518,6 @@ class MainWindow(QMainWindow):
             # TODO: if it has a border or compression, also create a borderless version here
         
         return result
-
-        # if preset_copy['do_instagram_compression']
-
-        # # Set white border and instagram compression off
-        # preset_copy['do_instagram_compression'] = False
-        # preset_copy['add_white_border'] = False
-        # out_path_dir = os.path.dirname(out_path)
-        # out_path_orig_name, ext = os.path.splitext(os.path.basename(out_path))
-        # variant_path = os.path.join(out_path_dir, out_path_orig_name + '_v_noframe_uncompressed' + ext)
-
-        # return (current_file_path, variant_path, preset_copy)
 
     def _trigger_batch_starred_export(self):
         """Assembles folder collection files tracking active star records into batch job blocks."""
