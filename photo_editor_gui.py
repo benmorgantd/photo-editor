@@ -449,12 +449,13 @@ class MainWindow(QMainWindow):
         logger.info("Main photo editor workspace frame initialization lifecycle complete.")
 
     @property
-    def active_crop_variant(self):
+    def active_crop_data(self):
         crop_variants = self.preset.get('crop_variants', dict())
-        print(crop_variants)  # dict(str, dict)
-        active_variant = self.preset.get('active_crop_variant', 'default')
-        print(active_variant) 
-        return crop_variants.get(active_variant, PhotoEditor.DEFAULT_PRESET['crop_variants']['default'])
+        return crop_variants.get(self.active_crop_variant, PhotoEditor.DEFAULT_PRESET['crop_variants']['default'])
+    
+    @property
+    def active_crop_variant(self):
+        return self.preset.get('active_crop_variant', 'default')
     
     def _read_preset_from_manifest(self, file_path: str) -> dict:
         """Queries the consolidated database file using absolute path strings as keys.
@@ -825,8 +826,8 @@ class MainWindow(QMainWindow):
 
     def _toggle_aspect_ratio_flip(self):
         """Inverts the active bounding box aspect ratio horizontally vs vertically."""
-        is_flipped = self.active_crop_variant.get("crop_aspect_ratio_flipped", False)
-        self.active_crop_variant["crop_aspect_ratio_flipped"] = not is_flipped
+        is_flipped = self.active_crop_data.get("crop_aspect_ratio_flipped", False)
+        self.active_crop_data["crop_aspect_ratio_flipped"] = not is_flipped
         if not self.is_updating_ui:
             self._update_target_resolution_label()
             self._save_current_edits_to_session_cache()
@@ -845,7 +846,6 @@ class MainWindow(QMainWindow):
     def _apply_auto_edits(self):
         '''Applies the auto edit calculation to the image'''
         logger.info('Applying auto edits')
-        print(self.preset)
         auto_edit_results = PhotoEditor.calculate_auto_preset(self.preview_matrix)
 
         _prev_active_crop_variant = self.preset.get('active_crop_variant', 'default')
@@ -854,7 +854,6 @@ class MainWindow(QMainWindow):
         self.preset = PhotoEditor.DEFAULT_PRESET.copy()
 
         for key, value in auto_edit_results.items():
-            print(key, value)
             if isinstance(value, dict):
                 for _k, _v in value.items():
                     self.preset[key][_k] = _v
@@ -945,6 +944,25 @@ class MainWindow(QMainWindow):
         self.sliders_layout.addWidget(g_preset)
 
         g_crop = CollapsibleGroupBox("Crop & Border Configuration")
+        
+        # Crop Variants
+        self.crop_variant_combo = QComboBox()
+        variant_hlayout = QHBoxLayout()
+        self.crop_variant_combo.addItem("default")
+        self.crop_variant_combo.currentTextChanged.connect(lambda txt: self._on_crop_variant_changed(txt))
+        variant_hlayout.addWidget(QLabel("Crop Variant Selection"))
+        variant_hlayout.addWidget(self.crop_variant_combo)
+
+        self.add_crop_variant_btn = QPushButton("+")
+        self.add_crop_variant_btn.setMaximumWidth(self.add_crop_variant_btn.sizeHint().height())
+        self.add_crop_variant_btn.clicked.connect(self._add_crop_variant)
+        self.remove_crop_variant_btn = QPushButton("-")
+        self.remove_crop_variant_btn.clicked.connect(self._remove_crop_variant)
+        self.remove_crop_variant_btn.setMaximumWidth(self.remove_crop_variant_btn.sizeHint().height())
+        variant_hlayout.addWidget(self.add_crop_variant_btn)
+        variant_hlayout.addWidget(self.remove_crop_variant_btn)
+        g_crop.content_layout.addLayout(variant_hlayout)
+
         self.crop_ratio_combo = QComboBox()
         self.crop_ratio_combo.addItems(["Free", "Original", "1:1", "4:5", "5:7", "8:10", "16:9"])
         self.crop_ratio_combo.currentTextChanged.connect(lambda txt: self._update_preset_key("crop_aspect_ratio", txt))
@@ -1151,20 +1169,29 @@ class MainWindow(QMainWindow):
     def _apply_preset_to_ui(self):
         """Maps parameters sequentially across GUI element items, blocking nested validation loops."""
         self.is_updating_ui = True
-        self.cb_instagram.setChecked(self.active_crop_variant.get("do_instagram_compression", True))
+
+        # Add all crop variants
+        self.crop_variant_combo.currentTextChanged.disconnect()
+        self.crop_variant_combo.clear()
+        for crop_variant_name in self.preset.get('crop_variants'):
+            self.crop_variant_combo.addItem(crop_variant_name)
+        self.crop_variant_combo.setCurrentText(self.active_crop_variant)
+        self.crop_variant_combo.currentTextChanged.connect(self._on_crop_variant_changed)
+
+        self.cb_instagram.setChecked(self.active_crop_data.get("do_instagram_compression", True))
         self.cb_apply_temp.setChecked(self.preset.get("apply_temperature_adjustment", True))
 
-        self.crop_ratio_combo.setCurrentText(self.active_crop_variant.get("crop_aspect_ratio", "Free"))
-        self.cb_white_border.setChecked(self.active_crop_variant.get("add_white_border", False))
+        self.crop_ratio_combo.setCurrentText(self.active_crop_data.get("crop_aspect_ratio", "Free"))
+        self.cb_white_border.setChecked(self.active_crop_data.get("add_white_border", False))
 
-        self.sliders_map["resolution_percentage"].setValue(int(self.active_crop_variant.get("resolution_percentage", 100)))
-        self.sliders_map["crop_rotation"].setValue(int(self.active_crop_variant.get("crop_rotation", 0)))
-        self.sliders_map["crop_size"].setValue(int(self.active_crop_variant.get("crop_size", 100)))
-        self.sliders_map["crop_free_width"].setValue(int(self.active_crop_variant.get("crop_free_width", 100)))
-        self.sliders_map["crop_free_height"].setValue(int(self.active_crop_variant.get("crop_free_height", 100)))
-        self.sliders_map["crop_center_x"].setValue(int(self.active_crop_variant.get("crop_center_x", 50)))
-        self.sliders_map["crop_center_y"].setValue(int(self.active_crop_variant.get("crop_center_y", 50)))
-        self.sliders_map["white_border_width_pct"].setValue(int(self.active_crop_variant.get("white_border_width_pct", 5)))
+        self.sliders_map["resolution_percentage"].setValue(int(self.active_crop_data.get("resolution_percentage", 100)))
+        self.sliders_map["crop_rotation"].setValue(int(self.active_crop_data.get("crop_rotation", 0)))
+        self.sliders_map["crop_size"].setValue(int(self.active_crop_data.get("crop_size", 100)))
+        self.sliders_map["crop_free_width"].setValue(int(self.active_crop_data.get("crop_free_width", 100)))
+        self.sliders_map["crop_free_height"].setValue(int(self.active_crop_data.get("crop_free_height", 100)))
+        self.sliders_map["crop_center_x"].setValue(int(self.active_crop_data.get("crop_center_x", 50)))
+        self.sliders_map["crop_center_y"].setValue(int(self.active_crop_data.get("crop_center_y", 50)))
+        self.sliders_map["white_border_width_pct"].setValue(int(self.active_crop_data.get("white_border_width_pct", 5)))
 
         self.sliders_map["values_multiplier"].setValue(int(self.preset.get("values_multiplier", 1.0) * 100))
         self.sliders_map["color_multiplier"].setValue(int(self.preset.get("color_multiplier", 1.0) * 100))
@@ -1223,11 +1250,11 @@ class MainWindow(QMainWindow):
             self.lbl_live_target_res.setText("Target Export Res: -")
             return
             
-        ratio_mode = self.active_crop_variant.get("crop_aspect_ratio", "Free")
+        ratio_mode = self.active_crop_data.get("crop_aspect_ratio", "Free")
         if ratio_mode == "Free":
             box_w = int(max(10, min(100, self.preset.get("crop_free_width", 100))) / 100.0 * w)
             box_h = int(max(10, min(100, self.preset.get("crop_free_height", 100))) / 100.0 * h)
-            if self.active_crop_variant.get("crop_aspect_ratio_flipped", False):
+            if self.active_crop_data.get("crop_aspect_ratio_flipped", False):
                 box_w, box_h = box_h, box_w
         else:
             if ratio_mode == "Original": target_ratio = w / h
@@ -1238,7 +1265,7 @@ class MainWindow(QMainWindow):
             elif ratio_mode == "16:9": target_ratio = 16.0 / 9.0 if w >= h else 9.0 / 16.0
             else: target_ratio = w / h
                 
-            if self.active_crop_variant.get("crop_aspect_ratio_flipped", False):
+            if self.active_crop_data.get("crop_aspect_ratio_flipped", False):
                 target_ratio = 1.0 / target_ratio
                 
             if w / h >= target_ratio:
@@ -1252,7 +1279,7 @@ class MainWindow(QMainWindow):
             box_w = int(max_w * size_scale)
             box_h = int(max_h * size_scale)
 
-        if self.active_crop_variant.get("do_instagram_compression", True):
+        if self.active_crop_data.get("do_instagram_compression", True):
             final_w = 1080
             final_h = int(final_w * (box_h / box_w))
         else:
@@ -1282,8 +1309,8 @@ class MainWindow(QMainWindow):
             value (Any): Payload setting values configuration attributes.
         """
         # TODO: if the key is part of the crop keys. This is making it more complex
-        if key in self.preset['crop_variants']['default']:
-            self.preset['crop_variants'][self.preset['active_crop_variant']][key] = value
+        if key in self.active_crop_data:
+            self._update_nested_crop_variant_preset(key, value)
         else:
             self.preset[key] = value
         if not self.is_updating_ui:
@@ -1301,6 +1328,12 @@ class MainWindow(QMainWindow):
             value (float): Granular offset floating point scalar value setting.
         """
         self.preset["color_adjustments"][band][prop] = value
+        if not self.is_updating_ui:
+            self._save_current_edits_to_session_cache()
+            self._refresh_viewport()
+    
+    def _update_nested_crop_variant_preset(self, key: str, value: Any):
+        self.preset['crop_variants'][self.active_crop_variant][key] = value
         if not self.is_updating_ui:
             self._save_current_edits_to_session_cache()
             self._refresh_viewport()
@@ -1408,7 +1441,7 @@ class MainWindow(QMainWindow):
             self.histogram_widget.render_histogram(render_array)
             img_uint8 = (np.clip(render_array, 0.0, 1.0) * 255.0).astype(np.uint8)
         else:
-            cropped_preview = PhotoEditor.apply_crop(self.preview_matrix, self.active_crop_variant)
+            cropped_preview = PhotoEditor.apply_crop(self.preview_matrix, self.active_crop_data)
             render_array = PhotoEditor.run_parallel_pipeline(cropped_preview, self.preset)
             self.histogram_widget.render_histogram(render_array)
             img_uint8 = (np.clip(render_array, 0.0, 1.0) * 255.0).astype(np.uint8)
@@ -1641,6 +1674,49 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "Purge Complete", "Session cache manifest database cleared.")
             except Exception as ex:
                 logger.error(f"Error executing complete storage context purge pass: {ex}")
+    
+    def _on_crop_variant_changed(self, variant):
+        if not os.path.isfile(self.current_file_path):
+            return
+        # TODO: bail if no picture is loaded
+        logger.info(f"Crop variant changed to {variant}")
+
+        self._update_preset_key('active_crop_variant', variant)
+        self._apply_preset_to_ui()
+    
+    def _add_crop_variant(self):
+        if not os.path.isfile(self.current_file_path):
+            return
+        num_existing = self.crop_variant_combo.count()
+
+        if num_existing > 1:
+            name = f'variant {num_existing}'
+        else:
+            name = 'variant 1'
+
+        logger.info(f'Adding crop variant {name}')
+        # When we add a crop variant we need to give it the default json data
+        self.preset['crop_variants'].setdefault(name, dict())
+        self.preset['crop_variants'][name] = PhotoEditor.DEFAULT_PRESET['crop_variants']['default'].copy()
+
+        self.crop_variant_combo.addItem(name)
+        self.crop_variant_combo.setCurrentIndex(num_existing)
+
+        # TODO: when we build the ui we need to add all saved crop variants
+    
+    def _remove_crop_variant(self):
+        if not os.path.isfile(self.current_file_path):
+            return
+        variant_name = self.crop_variant_combo.currentText()
+        variant_index = self.crop_variant_combo.currentIndex()
+
+        if variant_name != 'default':
+            logger.info(f'Removing crop variant {variant_name}')
+            # Remove the item from the dict before removing it from the combo box 
+            # This way when the callback triggers the item doesn't exist in the dict
+            self.preset['crop_variants'].pop(variant_name)
+            self.crop_variant_combo.removeItem(variant_index)
+            self.crop_variant_combo.setCurrentIndex(max(variant_index - 1), 0)
 
 
 def main():
