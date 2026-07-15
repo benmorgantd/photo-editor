@@ -152,6 +152,42 @@ class ExportWorker(QThread):
             self.finished_signal.emit(False, f"Export operation stopped due to exception: {str(e)}")
 
 
+import copy
+
+class FileEditHistory:
+    def __init__(self, default_preset: dict):
+        # Initialize the stack with a deep copy of the default state
+        self.states = [copy.deepcopy(default_preset)]
+        self.current_index = 0
+
+    def push_state(self, new_preset: dict):
+        # If we undid and then made a new edit, truncate the redo future
+        self.states = self.states[:self.current_index + 1]
+        
+        # Append the new state and advance the pointer
+        self.states.append(copy.deepcopy(new_preset))
+        self.current_index += 1
+
+    def undo(self) -> dict:
+        if self.can_undo():
+            self.current_index -= 1
+        return self.get_current_state()
+
+    def redo(self) -> dict:
+        if self.can_redo():
+            self.current_index += 1
+        return self.get_current_state()
+
+    def can_undo(self) -> bool:
+        return self.current_index > 0
+
+    def can_redo(self) -> bool:
+        return self.current_index < len(self.states) - 1
+
+    def get_current_state(self) -> dict:
+        return copy.deepcopy(self.states[self.current_index])
+    
+
 class CustomFileSystemModel(QFileSystemModel):
     """Extended file model inserting contextual status markers dynamically inside listings.
 
@@ -411,6 +447,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Free Python Desktop Photo Editor by Ben Morgan")
         self.resize(1600, 950)
 
+        self.history_registry = dict()
+
         self.current_file_path = ""
         self.preview_matrix = None
         self.show_original_state = False
@@ -549,24 +587,29 @@ class MainWindow(QMainWindow):
         export_all_starred_action.triggered.connect(self._trigger_batch_starred_export)
         file_menu.addAction(export_all_starred_action)
 
-        tools_menu = menu_bar.addMenu("&Tools")
+        edit_menu = menu_bar.addMenu('&Edit')
+
+        undo_action = QAction('&Undo', self)
+        undo_action.setShortcut(QKeySequence('Ctrl+Z'))
+        undo_action.triggered.connect(self._undo)
+        edit_menu.addAction(undo_action)
 
         reset_edits_action = QAction('&Reset Edits', self)
         reset_edits_action.setShortcut(QKeySequence('Ctrl+R'))
         reset_edits_action.triggered.connect(self._reset_edits)
-        tools_menu.addAction(reset_edits_action)
+        edit_menu.addAction(reset_edits_action)
         
         copy_settings_action = QAction("&Copy Settings", self)
         copy_settings_action.setShortcut(QKeySequence("Ctrl+C"))
         copy_settings_action.triggered.connect(self._copy_edit_settings)
-        tools_menu.addAction(copy_settings_action)
+        edit_menu.addAction(copy_settings_action)
 
         paste_settings_action = QAction("&Paste Settings", self)
         paste_settings_action.setShortcut(QKeySequence("Ctrl+V"))
         paste_settings_action.triggered.connect(self._paste_edit_settings)
-        tools_menu.addAction(paste_settings_action)
+        edit_menu.addAction(paste_settings_action)
 
-        tools_menu.addSeparator()
+        tools_menu = menu_bar.addMenu("&Tools")
 
         self.highlight_clipped_action = QAction("&Highlight Clipped Pixels", self)
         self.highlight_clipped_action.setCheckable(True)
@@ -615,6 +658,13 @@ class MainWindow(QMainWindow):
         reset_view_action.setShortcut(QKeySequence("F"))
         reset_view_action.triggered.connect(self._zoom_to_fit)
         view_menu.addAction(reset_view_action)
+    
+    def _undo(self):
+        logger.info(f'Undoing one step for {self.current_file_path}')
+        state_to_render = self.history_registry[self.current_file_path].undo()
+        self.preset = state_to_render  # It's already copied
+        self._apply_preset_to_ui()
+        self._save_current_edits_to_session_cache()
     
     def _reset_edits(self):
         logger.info(f'Reseting edits for {self.current_file_path}')
@@ -1322,8 +1372,14 @@ class MainWindow(QMainWindow):
         self.sliders_map["grain_size"].setValue(int(self.preset.get("grain_size", 1.0) * 10))
 
         self.is_updating_ui = False
+
+        self._update_undo_history_for_file(self.current_file_path)
         self._update_target_resolution_label()
         self._refresh_viewport()
+    
+    def _update_undo_history_for_file(self, file_path):
+        self.history_registry.setdefault(file_path, FileEditHistory(self._read_preset_from_manifest(self.current_file_path)))
+        self.history_registry[file_path].push_state(self.preset)
 
     def _update_target_resolution_label(self):
         """Calculates locked pixel bounds based on current crop selection modes and outputs data metrics."""

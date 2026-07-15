@@ -653,7 +653,7 @@ class PhotoEditor:
         valid_mask = (lum > 0.01) & (lum < 2.5)
 
         # ==========================================================
-        # 1. AUTO-EXPOSURE (Adjusted to +0.125 EV Bias)
+        # 1. AUTO-EXPOSURE (+0.125 EV Stylistic Bias)
         # ==========================================================
         target_display = np.float32(0.47) if is_linear else np.float32(0.48)
         current_linear_median = np.median(lum[valid_mask]) if np.sum(valid_mask) > 0 else np.float32(0.18)
@@ -672,12 +672,11 @@ class PhotoEditor:
             ratio = target_display / max(display_median, 1e-4)
             ev_shift += float(np.log2(ratio) * 0.6)
             
-        # Adjusted: +0.125 EV gives a subtle, airy lift without overpowering highlights
         stylistic_ev_bias = 0.125
         auto_exposure = float(np.clip(ev_shift + stylistic_ev_bias, -2.5, 2.5))
 
         # ==========================================================
-        # 2. TONAL RECOVERY (Shadows Over Blacks & Protected Highlights)
+        # 2. TONAL RECOVERY (Refined Highlights & Shadows)
         # ==========================================================
         final_test_img = small * (np.float32(2.0 ** auto_exposure))
         final_tonemapped = cls._apply_sdr_preview(final_test_img, 1.0)
@@ -689,22 +688,22 @@ class PhotoEditor:
         t_p10 = np.percentile(t_lum_final, 10)
         t_p20 = np.percentile(t_lum_final, 20)
         t_p80 = np.percentile(t_lum_final, 80)
-        t_p90 = np.percentile(t_lum_final, 90)
+        t_p95 = np.percentile(t_lum_final, 95)
         t_p99 = np.percentile(t_lum_final, 99)
         
-        # Highlights: Pull-down will now naturally trigger less aggressively
+        # Highlights
         auto_highlights = 0.0
-        if t_p90 > 0.70:
-            auto_highlights = float(np.clip((0.70 - t_p90) * 4.5, -1.0, 0.0))
+        if t_p95 > 0.80:
+            auto_highlights = float(np.clip((0.80 - t_p95) * 2.5, -0.55, 0.0))
             
-        # Whites: Dynamic calculation based on the extreme peaks
+        # Whites
         auto_whites = 0.0
-        if t_p99 > 0.95:
-            auto_whites = float(np.clip((0.95 - t_p99) * 5.0, -0.60, 0.0))
+        if t_p99 > 0.96:
+            auto_whites = float(np.clip((0.96 - t_p99) * 4.0, -0.40, 0.0))
         elif t_p99 < 0.85:
-            auto_whites = float(np.clip((0.85 - t_p99) * 2.5, 0.0, 0.35))
+            auto_whites = float(np.clip((0.85 - t_p99) * 2.0, 0.0, 0.30))
             
-        # Shadows: Lifted mid-shadows for an airy aesthetic
+        # Shadows
         auto_shadows = 0.0
         if t_p10 < 0.12:
             auto_shadows = float(np.clip((0.12 - t_p10) * 7.0, 0.0, 0.75))
@@ -713,70 +712,94 @@ class PhotoEditor:
         midtone_range = float(t_p80 - t_p20)
         auto_contrast = float(np.clip(0.20 - (midtone_range * 0.25), 0.05, 0.20))
         
-        # Blacks: Highly restrained to preserve matte, lifted darks
+        # Blacks
         predicted_lum = lum * (2.0 ** auto_exposure)
         p005 = np.percentile(predicted_lum, 0.5)
         auto_blacks = float(np.clip((0.003 - p005) * 3.0, -0.10, 0.0)) if p005 > 0.003 else 0.0
 
         # ==========================================================
-        # 3. SUBTLE AUTO WHITE BALANCE & GLOBAL SATURATION
+        # 3. LANDSCAPE-AWARE AUTO WHITE BALANCE & TINT
         # ==========================================================
         max_c = np.max(small, axis=2)
         min_c = np.min(small, axis=2)
-        sat = np.where(max_c > 1e-5, (max_c - min_c) / max_c, 0.0)
+        chroma = max_c - min_c
+        sat = np.where(max_c > 1e-5, chroma / max_c, 0.0)
         
-        neutral_mask = (sat < 0.15) & (lum > 0.10) & (lum < 0.85)
-        auto_kelvin = 6500.0
-        auto_tint = 0.0
-        
-        if np.sum(neutral_mask) > 150:
-            mean_r = np.mean(small[:, :, 0][neutral_mask])
-            mean_g = np.mean(small[:, :, 1][neutral_mask])
-            mean_b = np.mean(small[:, :, 2][neutral_mask])
-            
-            rb_ratio = mean_r / max(mean_b, 1e-5)
-            if rb_ratio > 1.06:
-                auto_kelvin = float(np.clip(6500.0 - (rb_ratio - 1.0) * 1600.0, 4800.0, 6500.0))
-            elif rb_ratio < 0.94:
-                auto_kelvin = float(np.clip(6500.0 + (1.0 - rb_ratio) * 1800.0, 6500.0, 7800.0))
-                
-            rg_ratio = mean_g / max((mean_r + mean_b) * 0.5, 1e-5)
-            auto_tint = float(np.clip((1.0 - rg_ratio) * 1.0, -0.2, 0.2))
-
-        # Inverse saturation scaling based on current median saturation
-        current_median_sat = float(np.median(sat[valid_mask])) if np.sum(valid_mask) > 0 else 0.25
-        auto_vibrance = float(np.clip((0.35 - current_median_sat) * 0.9, -0.05, 0.25))
-        auto_saturation = float(np.clip((0.28 - current_median_sat) * 0.3, -0.05, 0.10))
-
-        # ==========================================================
-        # 4. CONTENT HEURISTICS (Foliage, Skin Tones, Sky Blues)
-        # ==========================================================
+        # Convert to HSV early so hue and sat are available for both WB and heuristics
         hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
         hue = hsv[:, :, 0]
         
+        lum_valid = (lum >= 0.10) & (lum <= 0.95)
+        
+        # Hierarchical Neutral Detection based on absolute RGB color purity (Chroma)
+        # Targets true achromatic references: clouds, snow, white water foam, gray rocks, asphalt
+        strict_neutrals = lum_valid & (chroma < 0.04)
+        relaxed_neutrals = lum_valid & (chroma < 0.08)
+        
+        if np.sum(strict_neutrals) > 100:
+            wb_mask = strict_neutrals
+        elif np.sum(relaxed_neutrals) > 100:
+            wb_mask = relaxed_neutrals
+        else:
+            # Fallback: Top 5% least chromatic pixels, capped at 0.12 to prevent
+            # color-casting scenes that genuinely lack neutral reference points
+            threshold = min(0.12, float(np.percentile(chroma[lum_valid], 5))) if np.sum(lum_valid) > 0 else 0.05
+            wb_mask = lum_valid & (chroma <= threshold)
+            
+        auto_kelvin = 6500.0
+        auto_tint = 0.0
+        
+        if np.sum(wb_mask) > 50:
+            mean_r = float(np.mean(small[:, :, 0][wb_mask]))
+            mean_g = float(np.mean(small[:, :, 1][wb_mask]))
+            mean_b = float(np.mean(small[:, :, 2][wb_mask]))
+            
+            # 1. CONTINUOUS KELVIN SHIFT
+            rb_ratio = mean_r / max(mean_b, 1e-5)
+            kelvin_shift = float(-np.log2(rb_ratio) * 2800.0)
+            auto_kelvin = float(np.clip(6500.0 + kelvin_shift, 4800.0, 8000.0))
+            
+            # 2. TINT CORRECTION
+            # Negative tint = magenta, Positive tint = green.
+            # If the scene has a green cast (mean_g > mean_rb), rg_ratio > 1.0.
+            # (1.0 - rg_ratio) yields a NEGATIVE value, shifting tint towards magenta to neutralize green.
+            # If the scene has a magenta cast (mean_g < mean_rb), rg_ratio < 1.0.
+            # (1.0 - rg_ratio) yields a POSITIVE value, shifting tint towards green to neutralize magenta.
+            mean_rb = (mean_r + mean_b) * 0.5
+            rg_ratio = mean_g / max(mean_rb, 1e-5)
+            auto_tint = float(np.clip((1.0 - rg_ratio) * 1.5, -0.25, 0.25))
+
+        # Global Saturation scaling
+        current_median_sat = float(np.median(sat[valid_mask])) if np.sum(valid_mask) > 0 else 0.22
+        auto_vibrance = float(np.clip((0.30 - current_median_sat) * 0.65, -0.05, 0.18))
+        auto_saturation = float(np.clip((0.24 - current_median_sat) * 0.20, -0.05, 0.06))
+
+        # ==========================================================
+        # 4. CONTENT HEURISTICS (Foliage, Warm Tones, Sky Blues)
+        # ==========================================================
         # Green / Foliage
         grass_mask = (hue >= 45.0) & (hue <= 135.0) & (sat > 0.12) & (lum > 0.05)
         grass_ratio = float(np.mean(grass_mask))
         green_sat_boost = float(np.clip(grass_ratio * 0.4, 0.0, 0.15)) if grass_ratio > 0.03 else 0.0
 
-        # Orange / Warm tones (Sunsets, skin tones)
+        # Orange / Warm tones
         orange_mask = (hue >= 10.0) & (hue < 45.0) & (sat > 0.15) & (lum > 0.08)
         orange_ratio = float(np.mean(orange_mask))
         orange_sat_boost = float(np.clip(orange_ratio * 0.3, 0.0, 0.12)) if orange_ratio > 0.03 else 0.0
 
         # Blue / Sky desaturation
-        sky_mask = (hue >= 190.0) & (hue <= 240.0) & (sat > 0.15) & (lum > 0.20)
-        sky_ratio = float(np.mean(sky_mask))
-        blue_sat_adjust = float(np.clip(-sky_ratio * 0.5, -0.22, -0.04)) if sky_ratio > 0.02 else 0.0
+        # sky_mask = (hue >= 190.0) & (hue <= 240.0) & (sat > 0.15) & (lum > 0.20)
+        # sky_ratio = float(np.mean(sky_mask))
+        blue_sat_adjust = float(np.clip(0.5, -0.22, -0.04))
 
         return {
-            "exposure": round(auto_exposure, 2),
+            "exposure": round(auto_exposure, 2) + 0.025,  # add a little of over-exposure
             "contrast": round(auto_contrast, 2),
             "highlights": round(auto_highlights, 2),
             "shadows": round(auto_shadows, 2),
             "whites": round(auto_whites, 2),
             "blacks": round(auto_blacks, 2),
-            "temp_kelvin": round(auto_kelvin, -1),
+            "temp_kelvin": round(auto_kelvin, -1) + 250.0,  # slightly warmer tint
             "tint": round(auto_tint, 2),
             "vibrance": round(auto_vibrance, 2),
             "saturation": round(auto_saturation, 2),
@@ -788,416 +811,8 @@ class PhotoEditor:
             "color_adjustments": {
                 "green": {"hue": 0.0, "sat": round(green_sat_boost, 2)},
                 "orange": {"hue": 0.0, "sat": round(orange_sat_boost, 2)},
-                "blue": {"hue": 0.0, "sat": round(blue_sat_adjust, 2)}
-            }
-        }
-    
-    @classmethod
-    def _calculate_auto_preset2(cls, img: np.ndarray, is_linear: bool = True) -> Dict[str, Any]:
-        # 1. Fast 512px downscaled proxy
-        h, w, _ = img.shape
-        scale = min(1.0, 512.0 / max(h, w))
-        small = cv2.resize(img, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        
-        # Ensure float32 representation [0.0, 1.0]
-        small = np.clip(np.float32(small), 0.0, 1.0)
-        
-        lum = (np.float32(0.2126) * small[:, :, 0] + 
-               np.float32(0.7152) * small[:, :, 1] + 
-               np.float32(0.0722) * small[:, :, 2])
-        lum_safe = np.maximum(lum, np.float32(1e-6))
-        
-        valid_mask = (lum > 0.01) & (lum < 2.5)
-
-        # ==========================================================
-        # 1. AUTO-EXPOSURE (4-Step Proxy Solver for ACES Curve)
-        # ==========================================================
-        target_display = np.float32(0.47) if is_linear else np.float32(0.48)
-        current_linear_median = np.median(lum[valid_mask]) if np.sum(valid_mask) > 0 else np.float32(0.18)
-        
-        ev_shift = float(np.log2(0.24 / max(current_linear_median, 1e-4)))
-        
-        for _ in range(4):
-            test_img = small * (np.float32(2.0 ** ev_shift))
-            tonemapped = cls._apply_sdr_preview(test_img, 1.0)
-            
-            t_lum = (np.float32(0.2126) * tonemapped[:, :, 0] + 
-                     np.float32(0.7152) * tonemapped[:, :, 1] + 
-                     np.float32(0.0722) * tonemapped[:, :, 2])
-            
-            display_median = np.median(t_lum[valid_mask]) if np.sum(valid_mask) > 0 else target_display
-            ratio = target_display / max(display_median, 1e-4)
-            ev_shift += float(np.log2(ratio) * 0.6)
-            
-        auto_exposure = float(np.clip(ev_shift, -2.5, 2.5))
-
-        # ==========================================================
-        # 2. DISPLAY-REFERRED TONAL RECOVERY
-        # ==========================================================
-        final_test_img = small * (np.float32(2.0 ** auto_exposure))
-        final_tonemapped = cls._apply_sdr_preview(final_test_img, 1.0)
-        
-        t_lum_final = (np.float32(0.2126) * final_tonemapped[:, :, 0] + 
-                       np.float32(0.7152) * final_tonemapped[:, :, 1] + 
-                       np.float32(0.0722) * final_tonemapped[:, :, 2])
-
-        t_p05 = np.percentile(t_lum_final, 5)
-        t_p20 = np.percentile(t_lum_final, 20)
-        t_p80 = np.percentile(t_lum_final, 80)
-        t_p95 = np.percentile(t_lum_final, 95)
-        
-        # Highlights: Pull down if top 5% is blowing out
-        auto_highlights = 0.0
-        if t_p95 > 0.75:
-            auto_highlights = float(np.clip((0.75 - t_p95) * 3.5, -1.0, 0.0))
-            
-        # Shadows: FIXED threshold. 0.05 represents true deep shadows, not mid-gray (0.18).
-        auto_shadows = 0.0
-        if t_p05 < 0.05:
-            auto_shadows = float(np.clip((0.05 - t_p05) * 6.0, 0.0, 0.60))
-
-        # Dynamic Contrast based on display midtone spread
-        midtone_range = float(t_p80 - t_p20)
-        auto_contrast = float(np.clip(0.22 - (midtone_range * 0.3), 0.05, 0.25))
-        
-        # Black Point Anchor: Deepest 0.5% on linear predicted data
-        predicted_lum = lum * (2.0 ** auto_exposure)
-        p005 = np.percentile(predicted_lum, 0.5)
-        auto_blacks = float(np.clip((0.005 - p005) * 8.0, -0.35, 0.0)) if p005 > 0.005 else 0.0
-
-        # ==========================================================
-        # 3. AUTO WHITE BALANCE & GLOBAL SATURATION
-        # ==========================================================
-        max_c = np.max(small, axis=2)
-        min_c = np.min(small, axis=2)
-        sat = np.where(max_c > 1e-5, (max_c - min_c) / max_c, 0.0)
-        
-        neutral_mask = (sat < 0.12) & (lum > 0.15) & (lum < 0.80)
-        auto_kelvin = 6500.0
-        auto_tint = 0.0
-        
-        if np.sum(neutral_mask) > 150:
-            mean_r = np.mean(small[:, :, 0][neutral_mask])
-            mean_g = np.mean(small[:, :, 1][neutral_mask])
-            mean_b = np.mean(small[:, :, 2][neutral_mask]) # Renamed from mean_z for clarity
-            
-            rb_ratio = mean_r / max(mean_b, 1e-5)
-            if rb_ratio > 1.08:
-                auto_kelvin = float(np.clip(6500.0 - (rb_ratio - 1.0) * 2800.0, 4200.0, 6500.0))
-            elif rb_ratio < 0.92:
-                auto_kelvin = float(np.clip(6500.0 + (1.0 - rb_ratio) * 3200.0, 6500.0, 8200.0))
-                
-            rg_ratio = mean_g / max((mean_r + mean_b) * 0.5, 1e-5)
-            auto_tint = float(np.clip((1.0 - rg_ratio) * 1.5, -0.3, 0.3))
-
-        # DYNAMIC VIBRANCE & SATURATION
-        # Calculate current color saturation across well-lit pixels
-        current_median_sat = float(np.median(sat[valid_mask])) if np.sum(valid_mask) > 0 else 0.25
-        
-        # Scale inversely: low saturation gets boosted, high saturation gets tamed/left alone
-        # Target baseline saturation is around 0.35 for a vibrant photo
-        auto_vibrance = float(np.clip((0.35 - current_median_sat) * 1.0, -0.10, 0.30))
-        auto_saturation = float(np.clip((0.30 - current_median_sat) * 0.4, -0.08, 0.12))
-
-        # ==========================================================
-        # 4. CONTENT HEURISTICS (Foliage & Orange/Skin Tones)
-        # ==========================================================
-        # Note: In OpenCV float32, Hue is in range [0.0, 360.0]
-        hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
-        hue = hsv[:, :, 0]
-        
-        # FIXED: Expanded green range down to 45 deg to catch yellowish natural grasses and foliage
-        grass_mask = (hue >= 45.0) & (hue <= 135.0) & (sat > 0.12) & (lum > 0.05)
-        grass_ratio = float(np.mean(grass_mask))
-        
-        green_sat_boost = 0.0
-        if grass_ratio > 0.03:  # Lowered threshold slightly to catch subtle landscapes
-            green_sat_boost = float(np.clip(grass_ratio * 0.5, 0.0, 0.18))
-
-        # NEW: Orange / Warm tone tracking (Sunsets, autumn leaves, skin tones)
-        # Orange sits roughly between 10 deg and 45 deg in 360 HSV
-        orange_mask = (hue >= 10.0) & (hue < 45.0) & (sat > 0.15) & (lum > 0.08)
-        orange_ratio = float(np.mean(orange_mask))
-        
-        orange_sat_boost = 0.0
-        if orange_ratio > 0.03:
-            orange_sat_boost = float(np.clip(orange_ratio * 0.35, 0.0, 0.15))
-
-        return {
-            "exposure": round(auto_exposure, 2),
-            "contrast": round(auto_contrast, 2),
-            "highlights": round(auto_highlights, 2),
-            "shadows": round(auto_shadows, 2),
-            "whites": 0.0,
-            "blacks": round(auto_blacks, 2),
-            "temp_kelvin": round(auto_kelvin, -1),
-            "tint": round(auto_tint, 2),
-            "vibrance": round(auto_vibrance, 2),
-            "saturation": round(auto_saturation, 2),
-            "texture": -0.05,
-            "clarity": -0.05,
-            "gaussian_blur": 0.01,
-            "grain": 0.05,
-            "hdr_compression": 1.0,
-            "color_adjustments": {
-                "green": {"hue": 0.0, "sat": round(green_sat_boost, 2)},
-                "orange": {"hue": 0.0, "sat": round(orange_sat_boost, 2)}
-            }
-        }
-    
-    @classmethod
-    def _calculate_auto_preset(cls, img: np.ndarray, is_linear: bool = True) -> Dict[str, Any]:
-        # 1. Fast 512px downscaled proxy
-        h, w, _ = img.shape
-        scale = min(1.0, 512.0 / max(h, w))
-        small = cv2.resize(img, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        
-        lum = (np.float32(0.2126) * small[:, :, 0] + 
-               np.float32(0.7152) * small[:, :, 1] + 
-               np.float32(0.0722) * small[:, :, 2])
-        lum_safe = np.maximum(lum, np.float32(1e-6))
-        
-        valid_mask = (lum > 0.01) & (lum < 2.5)
-
-        # ==========================================================
-        # 1. AUTO-EXPOSURE (4-Step Proxy Solver for ACES Curve)
-        # ==========================================================
-        target_display = np.float32(0.47) if is_linear else np.float32(0.48)
-        current_linear_median = np.median(lum[valid_mask]) if np.sum(valid_mask) > 0 else np.float32(0.18)
-        
-        ev_shift = float(np.log2(0.24 / max(current_linear_median, 1e-4)))
-        
-        for _ in range(4):
-            test_img = small * (np.float32(2.0 ** ev_shift))
-            tonemapped = cls._apply_sdr_preview(test_img, 1.0)
-            
-            t_lum = (np.float32(0.2126) * tonemapped[:, :, 0] + 
-                     np.float32(0.7152) * tonemapped[:, :, 1] + 
-                     np.float32(0.0722) * tonemapped[:, :, 2])
-            
-            display_median = np.median(t_lum[valid_mask]) if np.sum(valid_mask) > 0 else target_display
-            ratio = target_display / max(display_median, 1e-4)
-            ev_shift += float(np.log2(ratio) * 0.6)
-            
-        auto_exposure = float(np.clip(ev_shift, -2.5, 2.5))
-
-        # ==========================================================
-        # 2. DISPLAY-REFERRED TONAL RECOVERY (The Fix)
-        # ==========================================================
-        # Run the final exposure through the ACES preview to measure display percentiles
-        final_test_img = small * (np.float32(2.0 ** auto_exposure))
-        final_tonemapped = cls._apply_sdr_preview(final_test_img, 1.0)
-        
-        t_lum_final = (np.float32(0.2126) * final_tonemapped[:, :, 0] + 
-                       np.float32(0.7152) * final_tonemapped[:, :, 1] + 
-                       np.float32(0.0722) * final_tonemapped[:, :, 2])
-
-        # Evaluate percentiles on the bounded display output [0.0, 1.0]
-        t_p05 = np.percentile(t_lum_final, 5)
-        t_p20 = np.percentile(t_lum_final, 20)
-        t_p80 = np.percentile(t_lum_final, 80)
-        t_p95 = np.percentile(t_lum_final, 95)
-        
-        # Highlights: If top 5% is brighter than 0.75 display luminance, pull down
-        auto_highlights = 0.0
-        if t_p95 > 0.75:
-            auto_highlights = float(np.clip((0.75 - t_p95) * 3.5, -1.0, 0.0))
-            
-        # Shadows: If bottom 5% is darker than 0.18 display luminance, lift up
-        auto_shadows = 0.0
-        if t_p05 < 0.18:
-            auto_shadows = float(np.clip((0.18 - t_p05) * 5.0, 0.0, 0.85))
-
-        # Dynamic Contrast based on display midtone spread
-        midtone_range = float(t_p80 - t_p20)
-        auto_contrast = float(np.clip(0.22 - (midtone_range * 0.3), 0.05, 0.25))
-        
-        # Black Point Anchor: Deepest 0.5% on linear predicted data
-        predicted_lum = lum * (2.0 ** auto_exposure)
-        p005 = np.percentile(predicted_lum, 0.5)
-        auto_blacks = float(np.clip((0.005 - p005) * 8.0, -0.35, 0.0)) if p005 > 0.005 else 0.0
-
-        # ==========================================================
-        # 3. AUTO WHITE BALANCE (Strict Chromaticity Gating)
-        # ==========================================================
-        max_c = np.max(small, axis=2)
-        min_c = np.min(small, axis=2)
-        sat = np.where(max_c > 1e-5, (max_c - min_c) / max_c, 0.0)
-        
-        neutral_mask = (sat < 0.12) & (lum > 0.15) & (lum < 0.80)
-        auto_kelvin = 6500.0
-        auto_tint = 0.0
-        
-        if np.sum(neutral_mask) > 150:
-            mean_r = np.mean(small[:, :, 0][neutral_mask])
-            mean_g = np.mean(small[:, :, 1][neutral_mask])
-            mean_z = np.mean(small[:, :, 2][neutral_mask])
-            
-            rb_ratio = mean_r / max(mean_z, 1e-5)
-            if rb_ratio > 1.08:
-                auto_kelvin = float(np.clip(6500.0 - (rb_ratio - 1.0) * 2800.0, 4200.0, 6500.0))
-            elif rb_ratio < 0.92:
-                auto_kelvin = float(np.clip(6500.0 + (1.0 - rb_ratio) * 3200.0, 6500.0, 8200.0))
-                
-            rg_ratio = mean_g / max((mean_r + mean_z) * 0.5, 1e-5)
-            auto_tint = float(np.clip((1.0 - rg_ratio) * 1.5, -0.3, 0.3))
-
-        # ==========================================================
-        # 4. CONTENT HEURISTICS (Foliage & Skin Tone Protection)
-        # ==========================================================
-        hsv = cv2.cvtColor(np.clip(small, 0.0, 1.0), cv2.COLOR_RGB2HSV)
-        hue = hsv[:, :, 0]
-        
-        grass_mask = (hue >= 80.0) & (hue <= 140.0) & (sat > 0.15) & (lum > 0.05)
-        grass_ratio = np.sum(grass_mask) / (hsv.shape[0] * hsv.shape[1])
-        
-        green_sat_boost = 0.0
-        if grass_ratio > 0.05:
-            green_sat_boost = float(np.clip(grass_ratio * 0.4, 0.0, 0.20))
-
-        return {
-            "exposure": round(auto_exposure, 2),
-            "contrast": round(auto_contrast, 2),
-            "highlights": round(auto_highlights, 2),
-            "shadows": round(auto_shadows, 2),
-            "whites": 0.0,
-            "blacks": round(auto_blacks, 2),
-            "temp_kelvin": round(auto_kelvin, -1),
-            "tint": round(auto_tint, 2),
-            "vibrance": 0.25,
-            "saturation": 0.08,
-            "texture": -0.05,
-            "clarity": -0.05,
-            "gaussian_blur": 0.01,
-            "grain": 0.05,
-            "hdr_compression": 1.0,
-            "color_adjustments": {
-                "green": {"hue": 0.0, "sat": round(green_sat_boost, 2)},
-                "orange": {"hue": 0.0, "sat": 0.0}
-            }
-        }
-
-    @classmethod
-    def _calculate_auto_preset(cls, img: np.ndarray, is_linear: bool = True) -> Dict[str, Any]:
-        """
-        Analyzes raw HDR data using an iterative feedback loop against the ACES tonemapper 
-        to guarantee perfect exposure, combined with strict Kelvin gating and richer style defaults.
-        """
-        # 1. Work on a fast downscaled proxy of the RAW UNBOUNDED float data (~0.001 seconds)
-        h, w, _ = img.shape
-        scale = min(1.0, 512.0 / max(h, w))
-        small = cv2.resize(img, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        
-        # Calculate Rec.709 Luminance
-        lum = (np.float32(0.2126) * small[:, :, 0] + 
-               np.float32(0.7152) * small[:, :, 1] + 
-               np.float32(0.0722) * small[:, :, 2])
-        lum_safe = np.maximum(lum, np.float32(1e-6))
-        
-        # Isolate valid midtones, ignoring pure pitch black and specular sun highlights
-        valid_mask = (lum > 0.01) & (lum < 2.5)
-
-        # ==========================================================
-        # 1. AUTO-EXPOSURE (Iterative Proxy Solver for ACES Curve)
-        # ==========================================================
-        # Target standard crisp display midtone in bounded [0.0, 1.0] sRGB/display space
-        target_display = np.float32(0.44) if is_linear else np.float32(0.46)
-        current_linear_median = np.median(lum[valid_mask]) if np.sum(valid_mask) > 0 else np.float32(0.18)
-        
-        # Baseline linear guess
-        ev_shift = float(np.log2(0.22 / max(current_linear_median, 1e-4)))
-        
-        # 4-step feedback loop against the actual ACES curve to eliminate underexposure
-        for _ in range(4):
-            test_img = small * (np.float32(2.0 ** ev_shift))
-            tonemapped = cls._apply_sdr_preview(test_img, 1.0)
-            
-            t_lum = (np.float32(0.2126) * tonemapped[:, :, 0] + 
-                     np.float32(0.7152) * tonemapped[:, :, 1] + 
-                     np.float32(0.0722) * tonemapped[:, :, 2])
-            
-            display_median = np.median(t_lum[valid_mask]) if np.sum(valid_mask) > 0 else target_display
-            
-            # Calculate error ratio and refine EV shift
-            ratio = target_display / max(display_median, 1e-4)
-            # 0.6 damping factor ensures smooth convergence without overshoot
-            ev_shift += float(np.log2(ratio) * 0.6)
-            
-        auto_exposure = float(np.clip(ev_shift, -2.5, 2.5))
-
-        # ==========================================================
-        # 2. AUTO-TONAL RECOVERY (Predicted Linear Headroom)
-        # ==========================================================
-        predicted_lum = lum * (2.0 ** auto_exposure)
-        p02 = np.percentile(predicted_lum, 2)
-        p98 = np.percentile(predicted_lum, 98)
-        
-        auto_highlights = 0.0
-        if p98 > 1.2:
-            auto_highlights = float(np.clip((1.2 - p98) * 0.8, -1.0, 0.0))
-            
-        auto_shadows = 0.0
-        if p02 < 0.04:
-            auto_shadows = float(np.clip((0.04 - p02) * 12.0, 0.0, 0.85))
-
-        # ==========================================================
-        # 3. AUTO WHITE BALANCE (Strict Chromaticity Gating)
-        # ==========================================================
-        max_c = np.max(small, axis=2)
-        min_c = np.min(small, axis=2)
-        sat = np.where(max_c > 1e-5, (max_c - min_c) / max_c, 0.0)
-        
-        neutral_mask = (sat < 0.12) & (lum > 0.15) & (lum < 0.80)
-        
-        auto_kelvin = 6500.0
-        auto_tint = 0.0
-        
-        if np.sum(neutral_mask) > 150:
-            mean_r = np.mean(small[:, :, 0][neutral_mask])
-            mean_g = np.mean(small[:, :, 1][neutral_mask])
-            mean_z = np.mean(small[:, :, 2][neutral_mask])
-            
-            rb_ratio = mean_r / max(mean_z, 1e-5)
-            
-            if rb_ratio > 1.08:
-                auto_kelvin = float(np.clip(6500.0 - (rb_ratio - 1.0) * 2800.0, 4200.0, 6500.0))
-            elif rb_ratio < 0.92:
-                auto_kelvin = float(np.clip(6500.0 + (1.0 - rb_ratio) * 3200.0, 6500.0, 8200.0))
-                
-            rg_ratio = mean_g / max((mean_r + mean_z) * 0.5, 1e-5)
-            auto_tint = float(np.clip((1.0 - rg_ratio) * 1.5, -0.3, 0.3))
-
-        # ==========================================================
-        # 4. CONTENT HEURISTICS (Foliage & Skin Tone Protection)
-        # ==========================================================
-        hsv = cv2.cvtColor(np.clip(small, 0.0, 1.0), cv2.COLOR_RGB2HSV)
-        hue = hsv[:, :, 0]
-        
-        grass_mask = (hue >= 80.0) & (hue <= 140.0) & (sat > 0.15) & (lum > 0.05)
-        grass_ratio = np.sum(grass_mask) / (hsv.shape[0] * hsv.shape[1])
-        
-        green_sat_boost = 0.0
-        if grass_ratio > 0.05:
-            green_sat_boost = float(np.clip(grass_ratio * 0.4, 0.0, 0.20))
-
-        # Return complete preset with your richer style defaults locked in!
-        return {
-            "exposure": round(auto_exposure, 2),
-            "contrast": 0.05,
-            "highlights": round(auto_highlights, 2),
-            "shadows": round(auto_shadows, 2),
-            "temp_kelvin": round(auto_kelvin, -1),
-            "tint": round(auto_tint, 2),
-            "vibrance": 0.25,          # Boosted vibrance default
-            "saturation": 0.08,        # Boosted base saturation default
-            "texture": -0.05,          
-            "clarity": -0.05,          
-            "gaussian_blur": 0.01,     
-            "grain": 0.05,             
-            "hdr_compression": 1.0,    
-            "color_adjustments": {
-                "green": {"hue": 0.0, "sat": round(green_sat_boost, 2)},
-                "orange": {"hue": 0.0, "sat": 0.0} 
+                "blue": {"hue": 0.0, "sat": round(blue_sat_adjust, 2)},
+                "red" : {"hue" : 0.0, "sat" : 0.15}  # always increase any reds
             }
         }
 
