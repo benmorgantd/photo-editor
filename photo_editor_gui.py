@@ -579,6 +579,10 @@ class MainWindow(QMainWindow):
         self.apply_auto_edit_action.setShortcut(QKeySequence("1"))
         tools_menu.addAction(self.apply_auto_edit_action)
 
+        self.apply_auto_edit_to_folder_action = QAction('&Apply Auto Edits to Folder', self)
+        self.apply_auto_edit_to_folder_action.triggered.connect(self._apply_auto_edits_to_folder)
+        tools_menu.addAction(self.apply_auto_edit_to_folder_action)
+
         debug_menu = menu_bar.addMenu("&Debug")
         
         open_cache_action = QAction("Open Cache Folder Location Pass", self)
@@ -852,7 +856,7 @@ class MainWindow(QMainWindow):
 
     def _apply_auto_edits(self):
         '''Applies the auto edit calculation to the image'''
-        logger.info('Applying auto edits')
+        logger.info(f'Applying auto edits to {self.current_file_path}')
         auto_edit_results = PhotoEditor.calculate_auto_preset(self.preview_matrix)
 
         _prev_active_crop_variant = self.preset.get('active_crop_variant', 'default')
@@ -873,6 +877,68 @@ class MainWindow(QMainWindow):
 
         self._apply_preset_to_ui()
         self._save_current_edits_to_session_cache()
+    
+    def _apply_auto_edits_to_folder(self):
+        folder_path = self.file_model.filePath(self.tree_view.rootIndex())
+        print(folder_path)
+        folder_name = os.path.basename(folder_path)
+
+        # display a warning
+        confirm = QMessageBox.question(self, "Apply Auto Edits to Folder", 
+                                       "Are you sure you want to apply auto edits to all files in the folder?\n" \
+                                       f"This will overwrite any existing edits to files in \"{folder_name}\"",
+                                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        logger.info(f'Apply auto edits to all files in {folder_path}')
+
+
+        files_in_folder = os.listdir(folder_path)
+        num_files = len(files_in_folder)
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+
+        progress_dialog = QProgressDialog("Apply Auto Edits to Folder", None, 0, num_files, self)
+        progress_dialog.setWindowTitle(f"Applying Auto Edits to all files in folder: \"{folder_name}\"")
+        # progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        progress_dialog.setMinimumWidth(550)
+        progress_dialog.setValue(0)
+
+        try:
+            progress_dialog.show()
+
+            for i, file_name in enumerate(files_in_folder):
+                QApplication.processEvents()
+                progress_dialog.setValue(i)
+                progress_dialog.setLabelText(file_name)
+
+                file_path = os.path.join(folder_path, file_name)
+                file_path = os.path.normpath(file_path).replace('\\', '/')
+
+                if not os.path.isfile(file_path) or not file_name.endswith(SUPPORTED_EXTENSIONS):
+                    continue
+                
+                logger.info(f'Applying auto edits to {file_name}')
+
+                preview_matrix = PhotoEditor.load_image_matrix(file_path, preview=True)
+                auto_edit_results = PhotoEditor.calculate_auto_preset(preview_matrix)
+
+                preset = PhotoEditor.DEFAULT_PRESET.copy()
+
+                for key, value in auto_edit_results.items():
+                    if isinstance(value, dict):
+                        for _k, _v in value.items():
+                            preset[key][_k] = _v
+                    else:
+                        preset[key] = value
+                
+                self._write_preset_to_manifest(file_path, preset)
+        finally:
+            progress_dialog.setValue(progress_dialog.maximum())
+            QApplication.restoreOverrideCursor()
+        
     
     def _on_tree_selection_changed(self, current: QModelIndex, previous: QModelIndex):
         """Intercepts selection adjustments in the left side tree view pane.
