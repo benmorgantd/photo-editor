@@ -425,7 +425,10 @@ class MainWindow(QMainWindow):
         os.makedirs(self.cache_directory, exist_ok=True)
         self.state_ini_path = os.path.join(self.cache_directory, "session_state.ini")
         self.registry_json_path = os.path.join(self.cache_directory, "file_status_registry.json")
-        self.manifest_json_path = os.path.join(self.cache_directory, "photo_editor_presets_manifest.json")
+        self.manifest_json_folder = os.path.join(self.cache_directory, 'preset_manifests')
+        if not os.path.exists(self.manifest_json_folder):
+            os.makedirs(self.manifest_json_folder)
+        # self.manifest_json_path = os.path.join(self.cache_directory, "photo_editor_presets_manifest.json")
 
         self.starred_files = set()
         self.exported_files = set()
@@ -457,7 +460,18 @@ class MainWindow(QMainWindow):
     @property
     def active_crop_variant(self):
         return self.preset.get('active_crop_variant', 'default')
-    
+
+
+    def _get_preset_manifest_filepath_for_image(self, image_filepath: str) -> str:
+        # combine the folder it's from and the file's name for a more unique name
+        folder_name = image_filepath.split('/')[-2].replace(' ', '_')
+        file_name = image_filepath.split('/')[-1]
+        # ex: yellowstone_2026_d2577.dng.json
+        manifest_file_name = f'{folder_name}_{file_name}.json'
+        manifest_file_path = os.path.join(self.manifest_json_folder, manifest_file_name)
+
+        return manifest_file_path
+
     def _read_preset_from_manifest(self, file_path: str) -> dict:
         """Queries the consolidated database file using absolute path strings as keys.
 
@@ -467,20 +481,20 @@ class MainWindow(QMainWindow):
         Returns:
             dict: Preset mapping configuration properties.
         """
-        start = time.time()
-        if os.path.exists(self.manifest_json_path):
+
+        manifest_file_path = self._get_preset_manifest_filepath_for_image(file_path)
+        logger.info(f'Using manifest filepath {manifest_file_path}')
+
+        if os.path.exists(manifest_file_path):
             try:
-                with open(self.manifest_json_path, "r", encoding="utf-8") as f:
+                with open(manifest_file_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    file_path = file_path.replace('\\', '/')
-                    if file_path in data:
-                        return data[file_path]
+                    return data
             except Exception as e:
-                logger.error(f"Failed to query central manifest database registry layout parameters: {e}")
+                logger.error(f'Failed to get preset manifest data for image {file_path}: {e}')
         
-        logger.info(f"Failed to find preset value for {file_path}, using default.")
-        result = json.loads(json.dumps(self.default_preset))
-        print(f'Time to read json preset: {time.time() - start}')
+        logger.info(f"Edits do not exist yet for {file_path}, using default.")
+        result = self.default_preset.copy()
         return result
 
     def _write_preset_to_manifest(self, file_path: str, preset_data: dict):
@@ -490,22 +504,22 @@ class MainWindow(QMainWindow):
             file_path (str): Direct image location key value.
             preset_data (dict): Snapshotted parameters data metrics layout maps.
         """
-        start = time.time()
-        data = {}
-        if os.path.exists(self.manifest_json_path):
-            try:
-                with open(self.manifest_json_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except Exception:
-                data = {}
+
+        manifest_file_path = self._get_preset_manifest_filepath_for_image(file_path)
+
+        # Just overwrite the file
+        # if os.path.exists(manifest_file_path):
+        #     try:
+        #         with open(manifest_file_path, "r", encoding="utf-8") as f:
+        #             data = json.load(f)
+        #     except Exception:
+        #         data = {}
         
-        data[file_path] = preset_data
         try:
-            with open(self.manifest_json_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            with open(manifest_file_path, "w", encoding="utf-8") as f:
+                json.dump(preset_data, f, indent=2, ensure_ascii=False)
         except Exception as e:
-            logger.error(f"Manifest database disk serialization write fault exception error: {e}")
-        print(f'Time to write preset: {time.time() - start}')
+            logger.error(f'Failed to write manifest json data for file {manifest_file_path}: {e}')
 
     def _init_menu_bar(self):
         """Assembles parent layout level drop-down action lists on the main toolbar shell."""
@@ -642,15 +656,18 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        if os.path.exists(self.manifest_json_path):
-            try:
-                with open(self.manifest_json_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    for recorded_path in data.keys():
-                        if os.path.exists(recorded_path):
-                            self.edited_files.add(recorded_path)
-            except Exception:
-                pass
+        # if os.path.exists(self.manifest_json_folder):
+        #     try:
+        #         # TODO: now that we don't have the full path of the edited file stored, we have to edit this
+        #         # We can store the filepath in the json data, but then we'd have to open each
+        #         for file_path in os.listdir(self.manifest_json_folder):
+        #         with open(self.manifest_json_path, "r", encoding="utf-8") as f:
+        #             data = json.load(f)
+        #             for recorded_path in data.keys():
+        #                 if os.path.exists(recorded_path):
+        #                     self.edited_files.add(recorded_path)
+        #     except Exception:
+        #         pass
 
     def _save_file_status_registry(self):
         """Serializes current priority list indices directly out to local disk paths."""
