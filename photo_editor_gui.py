@@ -508,12 +508,6 @@ class MainWindow(QMainWindow):
         manifest_file_path = self._get_preset_manifest_filepath_for_image(file_path)
 
         # Just overwrite the file
-        # if os.path.exists(manifest_file_path):
-        #     try:
-        #         with open(manifest_file_path, "r", encoding="utf-8") as f:
-        #             data = json.load(f)
-        #     except Exception:
-        #         data = {}
         
         try:
             with open(manifest_file_path, "w", encoding="utf-8") as f:
@@ -556,6 +550,11 @@ class MainWindow(QMainWindow):
         file_menu.addAction(export_all_starred_action)
 
         tools_menu = menu_bar.addMenu("&Tools")
+
+        reset_edits_action = QAction('&Reset Edits', self)
+        reset_edits_action.setShortcut(QKeySequence('Ctrl+R'))
+        reset_edits_action.triggered.connect(self._reset_edits)
+        tools_menu.addAction(reset_edits_action)
         
         copy_settings_action = QAction("&Copy Settings", self)
         copy_settings_action.setShortcut(QKeySequence("Ctrl+C"))
@@ -616,6 +615,14 @@ class MainWindow(QMainWindow):
         reset_view_action.setShortcut(QKeySequence("F"))
         reset_view_action.triggered.connect(self._zoom_to_fit)
         view_menu.addAction(reset_view_action)
+    
+    def _reset_edits(self):
+        logger.info(f'Reseting edits for {self.current_file_path}')
+        self.preset = self.default_preset.copy()
+        self._apply_preset_to_ui()
+        self._save_current_edits_to_session_cache()
+        self.statusBar().showMessage("Reset edits to default")
+
 
     def _copy_edit_settings(self):
         """Copies the current preset settings to an internal clipboard buffer or triggers native text copy."""
