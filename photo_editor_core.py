@@ -91,6 +91,11 @@ class PhotoEditor:
                     "resolution_percentage": 100,
                     "do_instagram_compression": True
                 }
+            },
+            "rgb_curves" : {
+                "r" : [[0.0, 0.25, 0.50, 0.75, 1.0], [0.0, 0.25, 0.50, 0.75, 1.0]],
+                "g" : [[0.0, 0.25, 0.50, 0.75, 1.0], [0.0, 0.25, 0.50, 0.75, 1.0]],
+                "b" : [[0.0, 0.25, 0.50, 0.75, 1.0], [0.0, 0.25, 0.50, 0.75, 1.0]]
             }
         }
 
@@ -463,19 +468,29 @@ class PhotoEditor:
                 new_lum_safe = np.maximum(new_lum, np.float32(1e-6))
                 
                 img = new_rgb * np.expand_dims(orig_lum / new_lum_safe, axis=2)
+        
+        # 10. Profile RGB Curves (Procedural 1D LUTs)
+        # Interpolates channel values rapidly for split-toning effects.
+        rgb_curves = preset.get('rgb_curves', None)
+        if rgb_curves:
+            for i, channel in enumerate(['r', 'g', 'b']):
+                if channel in rgb_curves:
+                    xp, yp = rgb_curves[channel]
+                    # Note: xp and yp must be monotonically increasing.
+                    img[:, :, i] = np.interp(img[:, :, i], xp, yp)
 
-        # 10. Optional Smoothing
+        # 11. Optional Smoothing
         blur_radius = preset.get('gaussian_blur', 0.0)
         if blur_radius > 0:
             sigma = float(blur_radius * 1.5)
             img = cv2.GaussianBlur(img, (0, 0), sigmaX=sigma, sigmaY=sigma)
 
-        # 11. Display Preparation: Tonemapping at the end of float processing
+        # 12. Display Preparation: Tonemapping at the end of float processing
         hdr_comp = preset.get('hdr_compression', 0.0)
         if hdr_comp > 0.0:
             img = cls._apply_sdr_preview(img, hdr_comp)
 
-        # 12. Final In-Place Hard Clip to SDR Monitor Bounds [0.0, 1.0]
+        # 13. Final In-Place Hard Clip to SDR Monitor Bounds [0.0, 1.0]
         np.clip(img, 0.0, 1.0, out=img)
         return img
 
@@ -831,6 +846,8 @@ class PhotoEditor:
 
         cropped = self.apply_crop(self.original_image, crop_data)
         return self.run_parallel_pipeline(cropped, preset)
+
+    
 
 
 def export_photo(img_array: np.ndarray, output_path: str, preset: Dict[str, Any], max_mb: float = 8.0):
