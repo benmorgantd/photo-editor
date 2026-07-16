@@ -70,9 +70,6 @@ sys.excepthook = global_exception_handler
 if not HAS_RAWPY_GUI:
     logger.warning("GUI running without local environment rawpy binding confirmation context.")
 
-# TODO: we moved where crop and border, resolution information gets stored so we have to look for that elsewhere. 
-# We would do that by pulling it instead from the current crop variant instead of flatly from the preset. 
-
 class ExportWorker(QThread):
     """Background worker thread executing heavy matrix transformations and disk I/O.
 
@@ -111,6 +108,8 @@ class ExportWorker(QThread):
                     break
 
                 img_path, out_path, item_preset = item
+                active_crop_variant = item_preset['active_crop_variant']
+                crop_data = item_preset['crop_variants'][active_crop_variant]
                 base_name = os.path.basename(img_path)
                 
                 logger.info(f"Starting batch task segment processing pass ({idx+1}/{total_files}): {base_name}")
@@ -123,7 +122,7 @@ class ExportWorker(QThread):
                     break
 
                 self.progress_signal.emit(f"[{idx+1}/{total_files}] Applying high-res crop dimensions for: {base_name}...")
-                cropped_full = PhotoEditor.apply_crop(full_res, item_preset)
+                cropped_full = PhotoEditor.apply_crop(full_res, crop_data)
 
                 if self._is_cancelled:
                     break
@@ -1651,6 +1650,8 @@ class MainWindow(QMainWindow):
         out_path_dir = os.path.dirname(out_path)
         out_path_orig_name, ext = os.path.splitext(os.path.basename(out_path))
 
+        active_crop_variant = preset['active_crop_variant']
+
         # No frame and uncompressed
         for crop_variant_name, crop_data in preset['crop_variants'].items():
             preset_copy = json.loads(json.dumps(preset))
@@ -1659,7 +1660,9 @@ class MainWindow(QMainWindow):
             preset_copy['active_crop_variant'] = crop_variant_name
             variant_path = os.path.join(out_path_dir, out_path_orig_name + f'_v_crop_{crop_variant_name}' + ext)
 
-            result.append((current_file_path, variant_path, preset_copy))
+            if crop_variant_name != active_crop_variant:
+                # otherwise we'd export duplicates
+                result.append((current_file_path, variant_path, preset_copy))
             
             # TODO: if it has a border or compression, also create a borderless version here
         
@@ -1673,15 +1676,15 @@ class MainWindow(QMainWindow):
 
         logger.info(f"Scanning target location folder for starred references: {self.current_selected_folder_path}")
         starred_in_folder = []
-        norm_starred_files = [os.path.normpath(f) for f in self.starred_files]
+        starred_files = [f.replace('\\', '/') for f in self.starred_files]
 
         try:
             for item in os.listdir(self.current_selected_folder_path):
-                norm_full_item_path = os.path.normpath(os.path.join(self.current_selected_folder_path, item))
-                if os.path.isfile(norm_full_item_path) and norm_full_item_path in norm_starred_files:
-                    ext = os.path.splitext(norm_full_item_path)[1].lower()
+                full_item_path = os.path.join(self.current_selected_folder_path, item).replace('\\', '/')
+                if os.path.isfile(full_item_path) and full_item_path in starred_files:
+                    ext = os.path.splitext(full_item_path)[1].lower()
                     if ext in SUPPORTED_EXTENSIONS:
-                        starred_in_folder.append(norm_full_item_path)
+                        starred_in_folder.append(full_item_path)
         except Exception as ex:
             logger.error(f"Failed to scan folder contents: {ex}")
             return
@@ -1701,7 +1704,7 @@ class MainWindow(QMainWindow):
             queue.append((img_path, out_path, item_preset))
 
             if self.is_export_all_variants_set:
-                queue.append(self._get_export_variants(img_path, out_path, item_preset))
+                queue += self._get_export_variants(img_path, out_path, item_preset)
 
         logger.info(f"Queued batch collection assembly done. Count: {len(queue)}")
         self._execute_progressive_export_queue(queue)
@@ -1725,14 +1728,13 @@ class MainWindow(QMainWindow):
         self.progress_dialog.setMinimumWidth(550)
         self.progress_dialog.setValue(0)
         
-
         self.export_thread = ExportWorker(queue, self.preset)
         self.progress_dialog.canceled.connect(self.export_thread.cancel)
 
         self.progress_dialog.show()
         self.export_thread.progress_signal.connect(self.progress_dialog.setLabelText)
         
-        def handle_progress_step(done, total):
+        def handle_progress_step(done, _):
             self.progress_dialog.setValue(done)
             
         self.export_thread.file_done_signal.connect(handle_progress_step)

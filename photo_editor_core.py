@@ -13,7 +13,7 @@ import sys
 
 
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any
 from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
@@ -492,7 +492,7 @@ class PhotoEditor:
         """
         h, w, c = src_matrix.shape
         active_crop_variant = preset.get('active_crop_variant', 'default')
-        crop_variant_data = preset.get(active_crop_variant, dict())
+        crop_variant_data = preset['crop_variants'][active_crop_variant]
         do_instagram_compression = crop_variant_data.get('do_instagram_compression', True)
 
         if do_instagram_compression:
@@ -617,8 +617,8 @@ class PhotoEditor:
         Returns:
             np.ndarray: Modified bounded border canvas matrix configuration layer.
         """
-        current_crop_variant = preset.get("active_crop_variant", "default")
-        crop_data = preset["crop_variants"].get(current_crop_variant, dict())
+        active_crop_variant = preset.get("active_crop_variant", "default")
+        crop_data = preset["crop_variants"][active_crop_variant]
 
         if not crop_data.get('add_white_border', False):
             return img
@@ -826,8 +826,8 @@ class PhotoEditor:
             np.ndarray: Rendered image matrix.
         """
 
-        current_crop_variant = preset.get("active_crop_variant", "default")
-        crop_data = preset["crop_variants"].get(current_crop_variant)
+        active_crop_variant = preset.get("active_crop_variant", "default")
+        crop_data = preset["crop_variants"][active_crop_variant]
 
         cropped = self.apply_crop(self.original_image, crop_data)
         return self.run_parallel_pipeline(cropped, preset)
@@ -845,7 +845,7 @@ def export_photo(img_array: np.ndarray, output_path: str, preset: Dict[str, Any]
     final_img_array = (np.clip(img_array, 0.0, 1.0) * 255.0).astype(np.uint8)
 
     active_crop_variant = preset.get('active_crop_variant', 'default')
-    crop_variant_data = preset.get(active_crop_variant, dict())
+    crop_variant_data = preset['crop_variants'][active_crop_variant]
     
     grain = preset.get('grain', 0.0)
     grain_size = preset.get('grain_size', 1.0)
