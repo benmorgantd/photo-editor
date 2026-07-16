@@ -4,7 +4,7 @@ Provides standard dialog windows, automated workspace batch queues, active monit
 histograms, and synchronized local execution logging routines.
 """
 
-import time
+import traceback
 import sys
 import os
 import json
@@ -13,6 +13,7 @@ import tempfile
 import configparser
 import logging
 from typing import Any, List
+import copy
 
 import cv2
 import numpy as np
@@ -25,13 +26,13 @@ except ImportError:
 
 from PIL import Image, ImageOps
 
-from PyQt6.QtCore import Qt, QDir, QThread, pyqtSignal, QTimer, QModelIndex
+from PyQt6.QtCore import Qt, QDir, QThread, pyqtSignal, QTimer, QModelIndex, QObject, QRunnable, QThreadPool
 from PyQt6.QtGui import QImage, QPixmap, QAction, QKeySequence, QFileSystemModel, QPainter, QKeyEvent, QFont, QIcon, QColor, QBrush
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QSplitter, QTreeView, QGraphicsView, QGraphicsScene, QPushButton,
     QSlider, QCheckBox, QComboBox, QLabel, QGroupBox, QScrollArea, QFileDialog,
-    QFrame, QLineEdit, QMenu, QProgressDialog, QMessageBox
+    QFrame, QLineEdit, QMenu, QProgressDialog, QMessageBox, QGraphicsPixmapItem
 )
 
 from photo_editor_core import PhotoEditor, export_photo, SUPPORTED_EXTENSIONS, RAW_EXTENSIONS
@@ -151,7 +152,29 @@ class ExportWorker(QThread):
             self.finished_signal.emit(False, f"Export operation stopped due to exception: {str(e)}")
 
 
-import copy
+class ImageLoaderSignals(QObject):
+    """Defines the signals available from a running image loading worker thread."""
+    finished = pyqtSignal(str, object)  # Emits (file_path, full_res_matrix)
+    error = pyqtSignal(str, str)        # Emits (file_path, error_message)
+
+
+class FullResLoaderWorker(QRunnable):
+    """Worker task that decodes full-resolution matrices in a background thread pool."""
+    def __init__(self, file_path: str):
+        super().__init__()
+        self.file_path = file_path
+        self.signals = ImageLoaderSignals()
+
+    def run(self):
+        try:
+            # This heavy I/O and matrix decoding now runs off the main event loop
+            matrix = PhotoEditor.load_image_matrix(self.file_path, preview=False)
+            self.signals.finished.emit(self.file_path, matrix)
+        except Exception as e:
+            err_msg = f"{e}\n{traceback.format_exc()}"
+            self.signals.error.emit(self.file_path, err_msg)
+
+
 
 class FileEditHistory:
     def __init__(self, default_preset: dict):
@@ -446,10 +469,13 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Free Python Desktop Photo Editor by Ben Morgan")
         self.resize(1600, 950)
 
+        self.thread_pool = QThreadPool.globalInstance()
+
         self.history_registry = dict()
 
         self.current_file_path = ""
         self.preview_matrix = None
+        self.proxy_matrix = None
         self.show_original_state = False
         self.is_updating_ui = False
         self.export_thread = None
@@ -485,6 +511,8 @@ class MainWindow(QMainWindow):
         self.preview_render_timer.setSingleShot(True)
         self.preview_render_timer.timeout.connect(self._render_stationary_pane)
         self.preview_target_path = ""
+
+        self.is_scrubbing = False
 
         self.showMaximized()
         logger.info("Main photo editor workspace frame initialization lifecycle complete.")
@@ -835,6 +863,10 @@ class MainWindow(QMainWindow):
         self.scene = QGraphicsScene()
         self.view = ZoomableGraphicsView(self.scene)
         center_layout.addWidget(self.view)
+        self.pixmap_item = QGraphicsPixmapItem()
+        self.pixmap_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        self.scene.addItem(self.pixmap_item)
+        self._current_view_size = (0, 0)
 
         control_row = QHBoxLayout()
         self.toggle_btn = QPushButton("Toggle View: Original / Edited [Hold '\\' Key]")
@@ -1212,9 +1244,22 @@ class MainWindow(QMainWindow):
         value_edit.setFixedWidth(50)
         value_edit.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
+        # 1. State handlers for mouse press/release on the slider handle
+        def on_slider_pressed():
+            self.is_scrubbing = True
+
+        def on_slider_released():
+            self.is_scrubbing = False
+            # Force a final high-resolution evaluation at the final resting value
+            if not self.is_updating_ui:
+                callback(slider.value())
+
         def on_slider_changed(val):
             value_edit.setText(str(val))
             if not self.is_updating_ui:
+                # When dragging, this executes while self.is_scrubbing == True.
+                # When using keyboard arrows or clicking the track, self.is_scrubbing == False,
+                # which naturally evaluates at full resolution immediately.
                 callback(val)
 
         def on_text_confirmed():
@@ -1222,14 +1267,21 @@ class MainWindow(QMainWindow):
             try:
                 val = int(value_edit.text())
                 val = max(mn, min(mx, val))
+                
+                # Text inputs should always evaluate at full resolution
+                self.is_scrubbing = False 
                 self.is_updating_ui = True
                 slider.setValue(val)
                 self.is_updating_ui = False
+                
                 value_edit.setText(str(val))
                 callback(val)
             except ValueError:
                 value_edit.setText(str(slider.value()))
 
+        # 2. Connect the press and release signals
+        slider.sliderPressed.connect(on_slider_pressed)
+        slider.sliderReleased.connect(on_slider_released)
         slider.valueChanged.connect(on_slider_changed)
         value_edit.editingFinished.connect(on_text_confirmed)
         
@@ -1470,7 +1522,6 @@ class MainWindow(QMainWindow):
             self._save_current_edits_to_session_cache()
             self._refresh_viewport()
 
-    # TODO: we could do the same for crop with "nested preset"
     def _update_nested_color_preset(self, band: str, prop: str, value: float):
         """Modifies targeted spectral value slots inside isolated sub-dictionaries.
 
@@ -1543,9 +1594,14 @@ class MainWindow(QMainWindow):
                 logger.info("Exiting early because we are in browse mode")
                 return
             
-            self.preview_matrix = PhotoEditor.load_image_matrix(path, preview=True)  # this takes the most time, 5 sec
+            # 1. Load ONLY the fast proxy synchronously on the UI thread
+            self.proxy_matrix = PhotoEditor.load_image_matrix(path, preview=True, max_width=800)
+            
+            # Temporarily point preview_matrix to the proxy so the UI renders immediately
+            self.preview_matrix = self.proxy_matrix 
             self.preset = self._read_preset_from_manifest(path)
 
+            # 2. Extract lightweight metadata (fast I/O only, avoid deep decoding)
             if ext in [e.lower() for e in RAW_EXTENSIONS]:
                 if not HAS_RAWPY_GUI:
                     raise ImportError("Cannot parse targeted RAW file metadata because rawpy module is not defined.")
@@ -1565,15 +1621,50 @@ class MainWindow(QMainWindow):
             
             size_mb = os.path.getsize(path) / (1024 * 1024)
             self.lbl_info_size.setText(f"File Disk Size: {size_mb:.2f} MB")
+            
+            # 3. Apply presets and render the proxy immediately
             self._apply_preset_to_ui()
+            self._zoom_to_fit()
             self._save_browsing_directory_state(os.path.dirname(path))
+
+            # 4. Dispatch the background task for the full-resolution matrix
+            self._start_background_fullres_load(path)
+
         except Exception as e:
             logger.error(f"Critical load validation exception encountered: {e}")
             self.statusBar().showMessage(f"Load Failure: {os.path.basename(path)}")
             self.scene.clear()
             self.preview_matrix = None
+            self.proxy_matrix = None
         finally:
             QApplication.restoreOverrideCursor()
+
+    def _start_background_fullres_load(self, path: str):
+        """Spawns a background thread to load the full-res matrix without blocking the UI."""
+        worker = FullResLoaderWorker(path)
+        worker.signals.finished.connect(self._on_fullres_load_complete)
+        worker.signals.error.connect(self._on_fullres_load_error)
+        self.thread_pool.start(worker)
+
+    def _on_fullres_load_complete(self, loaded_path: str, full_matrix: object):
+        """Receives the full-resolution matrix from the background thread and updates the viewport."""
+        # Race Condition Guard: If the user clicked another file while this was loading, discard it
+        if self.current_file_path != loaded_path:
+            logger.info(f"Discarding stale background matrix for: {loaded_path}")
+            return
+
+        logger.info(f"Background full-res load complete for: {loaded_path}")
+        self.preview_matrix = full_matrix
+        
+        # Trigger a silent refresh of your viewport with the high-resolution data
+        self._refresh_viewport()
+
+    def _on_fullres_load_error(self, failed_path: str, error_msg: str):
+        """Handles background loading exceptions."""
+        if self.current_file_path != failed_path:
+            return
+        logger.error(f"Failed to load full-res matrix in background: {error_msg}")
+        self.statusBar().showMessage(f"High-res preview failed to load: {os.path.basename(failed_path)}")
 
     def _on_toggle_view_clicked(self, checked: bool):
         """Swaps standard target calculation tracks to show comparison modes on button triggers.
@@ -1585,34 +1676,59 @@ class MainWindow(QMainWindow):
         self._refresh_viewport()
 
     def _refresh_viewport(self):
-        """Re-computes active filters to display raster data on the center view canvas."""
-        if self.preview_matrix is None: return
+        """
+        Re-computes active filters to display raster data on the canvas.
+        """
+        if self.preview_matrix is None:
+            return
+
+        # Use a lower-res proxy matrix during active slider dragging
+        source_matrix = self.proxy_matrix if self.is_scrubbing else self.preview_matrix
 
         if self.show_original_state:
-            render_array = self.preview_matrix
-            self.histogram_widget.render_histogram(render_array)
-            img_uint8 = (np.clip(render_array, 0.0, 1.0) * 255.0).astype(np.uint8)
+            render_array = source_matrix
         else:
-            cropped_preview = PhotoEditor.apply_crop(self.preview_matrix, self.active_crop_data)
+            cropped_preview = PhotoEditor.apply_crop(source_matrix, self.active_crop_data)
             render_array = PhotoEditor.run_parallel_pipeline(cropped_preview, self.preset)
-            self.histogram_widget.render_histogram(render_array)
-            img_uint8 = (np.clip(render_array, 0.0, 1.0) * 255.0).astype(np.uint8)
 
-            if self.highlight_clipped_action.isChecked():
-                mask_black = (img_uint8[:, :, 0] == 0) & (img_uint8[:, :, 1] == 0) & (img_uint8[:, :, 2] == 0)
-                mask_white = (img_uint8[:, :, 0] == 255) & (img_uint8[:, :, 1] == 255) & (img_uint8[:, :, 2] == 255)
-                img_uint8[mask_black | mask_white] = [255, 0, 0]
-                
+        # Trigger histogram asynchronously or on downsampled data to prevent UI blocks
+        self.histogram_widget.render_histogram(render_array)
+
+        # 2. Optimized conversion: reduce temporary array allocations
+        # Ensure working in float32; use out= parameters if your pipeline allows
+        img_uint8 = np.empty_like(render_array, dtype=np.uint8)
+        np.clip(render_array * 255.0, 0, 255, out=img_uint8, casting="unsafe")
+
+        # 3. Optimized Clipping Mask (evaluates faster than 6 separate channel arrays)
+        if not self.show_original_state and self.highlight_clipped_action.isChecked():
+            # Check for pure black (all channels 0) or pure white (all channels 255)
+            mask_black = not np.any(img_uint8, axis=-1)
+            mask_white = np.all(img_uint8 == 255, axis=-1)
+            
+            # Apply red highlight in-place
+            img_uint8[mask_black | mask_white] = [255, 0, 0]
+
+        if not self.show_original_state:
             img_uint8 = PhotoEditor.apply_white_border(img_uint8, self.preset)
 
+        # 4. Zero-copy QImage creation (ensure img_uint8 is C-contiguous)
+        if not img_uint8.flags['C_CONTIGUOUS']:
+            img_uint8 = np.ascontiguousarray(img_uint8)
+            
         h, w, ch = img_uint8.shape
-        q_image = QImage(img_uint8.data, w, h, ch * w, QImage.Format.Format_RGB888)
-        pixmap = QPixmap.fromImage(q_image)
+        bytes_per_line = ch * w
+        
+        # Note: QImage does not own the memory; keep a reference if not converting immediately
+        q_image = QImage(img_uint8.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        
+        # 5. Update persistent item instead of clearing scene
+        self.pixmap_item.setPixmap(QPixmap.fromImage(q_image))
 
-        self.scene.clear()
-        self.scene.addPixmap(pixmap)
-        self.scene.setSceneRect(0, 0, w, h)
-        self.view.zoom_to_fit()
+        # Only resize scene and re-zoom if the output dimensions actually changed
+        # if (w, h) != self._current_view_size:
+        #     self.scene.setSceneRect(QRectF(0, 0, w, h))
+        #     self.view.zoom_to_fit()
+        #     self._current_view_size = (w, h)
     
     def _zoom_to_fit(self):
         self.view.zoom_to_fit()
@@ -1815,6 +1931,7 @@ class MainWindow(QMainWindow):
                 self.file_model.layoutChanged.emit()
                 self.scene.clear()
                 self.preview_matrix = None
+                self.proxy_matrix = None
                 QMessageBox.information(self, "Purge Complete", "Session cache manifest database cleared.")
             except Exception as ex:
                 logger.error(f"Error executing complete storage context purge pass: {ex}")
