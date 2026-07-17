@@ -36,7 +36,7 @@ from PyQt6.QtWidgets import (
     QFrame, QLineEdit, QMenu, QProgressDialog, QMessageBox, QGraphicsPixmapItem, QRadioButton, QButtonGroup, QDoubleSpinBox, QSizePolicy
 )
 
-from photo_editor_core import PhotoEditor, export_photo, SUPPORTED_EXTENSIONS, RAW_EXTENSIONS, FilmProfile
+from photo_editor_core import PhotoEditor, export_photo, SUPPORTED_EXTENSIONS, RAW_EXTENSIONS, FILM_PROFILES
 
 # Setup persistent file logging locations locally inside specific subfolder structures
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) or os.getcwd()
@@ -1002,21 +1002,10 @@ class MainWindow(QMainWindow):
 
         apply_profiles_menu = edit_menu.addMenu('&Apply Film Profile')
 
-        portra_400_action = QAction('&Portra 400', self)
-        portra_400_action.triggered.connect(lambda: self._apply_film_profile(FilmProfile.PORTRA_400))
-        apply_profiles_menu.addAction(portra_400_action)
-
-        velvia_50_Action = QAction('&Velvia 50', self)
-        velvia_50_Action.triggered.connect(lambda: self._apply_film_profile(FilmProfile.VELVIA_50))
-        apply_profiles_menu.addAction(velvia_50_Action)
-
-        kodachrome_64_action = QAction('&Kodachrome 64', self)
-        kodachrome_64_action.triggered.connect(lambda: self._apply_film_profile(FilmProfile.KODACHROME_64))
-        apply_profiles_menu.addAction(kodachrome_64_action)
-
-        superia_400_action = QAction('&Superia 400', self)
-        superia_400_action.triggered.connect(lambda: self._apply_film_profile(FilmProfile.SUPERIA_400))
-        apply_profiles_menu.addAction(superia_400_action)
+        for profile_name in FILM_PROFILES:
+            profile_action = QAction(f'&{profile_name}', self)
+            profile_action.triggered.connect(lambda _, name=profile_name: self._apply_film_profile(name))
+            apply_profiles_menu.addAction(profile_action)
 
         tools_menu = menu_bar.addMenu("&Tools")
 
@@ -1109,30 +1098,18 @@ class MainWindow(QMainWindow):
         self._save_current_edits_to_session_cache()
         self.statusBar().showMessage("Preset configurations injected onto active workspace matrix.")
     
-    def _apply_film_profile(self, profile):
-        if profile is None:
+    def _apply_film_profile(self, profile_name):
+        print(f'applying film profile {profile_name}')
+        if profile_name is None:
             self.preset['rgb_curves'] = PhotoEditor.DEFAULT_PRESET['rgb_curves']
         else:
             self.preset.setdefault('rgb_curves', PhotoEditor.DEFAULT_PRESET['rgb_curves'])
-            for color in ['r', 'g', 'b']:
-                curve_values = profile.get_curve(color)
+            for color in 'rgb':
+                curve_values = FILM_PROFILES[profile_name][color]
                 self.preset['rgb_curves'][color][1] = curve_values
         
         self._apply_preset_to_ui()
         self._save_current_edits_to_session_cache()
-    
-    def _profiles_combobox_changed(self, text):
-        if text == 'None':
-            self._apply_film_profile(None)
-            return
-        elif text == 'Portra 400':
-            self._apply_film_profile(FilmProfile.PORTRA_400)
-        elif text == 'Velvia 50':
-            self._apply_film_profile(FilmProfile.VELVIA_50)
-        elif text == 'Kodachrome 64':
-            self._apply_film_profile(FilmProfile.KODACHROME_64)
-        elif text == 'Superia 400':
-            self._apply_film_profile(FilmProfile.SUPERIA_400)
 
     def _load_file_status_registry(self):
         """Parses local tracking data configurations to update view states."""
@@ -1575,20 +1552,18 @@ class MainWindow(QMainWindow):
         # Channel Selectors
         g_curves = CollapsibleGroupBox("RGB Curves")
 
-        # Combo box for common profiles
-        profile_preset_hlayout = QHBoxLayout()
-        profile_preset_hlayout.addWidget(QLabel('Curve Film Profile Presets: '))
-        profiles_combobox = QComboBox()
-        profiles_combobox.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        profiles_combobox.addItem('None')
-        profiles_combobox.addItem('Portra 400')
-        profiles_combobox.addItem('Velvia 50')
-        profiles_combobox.addItem('Kodachrome 64')
-        profiles_combobox.addItem('Superia 400')
-        profiles_combobox.currentTextChanged.connect(self._profiles_combobox_changed)
-        profile_preset_hlayout.addWidget(profiles_combobox)
+        # # Combo box for common profiles
+        # profile_preset_hlayout = QHBoxLayout()
+        # profile_preset_hlayout.addWidget(QLabel('Curve Film Profile Presets: '))
+        # profiles_combobox = QComboBox()
+        # profiles_combobox.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        # profiles_combobox.addItem('None')
+        # for profile_name in FILM_PROFILES:
+        #     profiles_combobox.addItem(profile_name)
+        # profiles_combobox.currentTextChanged.connect(self._profiles_combobox_changed)
+        # profile_preset_hlayout.addWidget(profiles_combobox)
 
-        g_curves.content_layout.addLayout(profile_preset_hlayout)
+        # g_curves.content_layout.addLayout(profile_preset_hlayout)
 
         channel_layout = QHBoxLayout()
         self.btn_group = QButtonGroup(self)
