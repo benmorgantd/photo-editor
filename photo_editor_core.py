@@ -9,11 +9,12 @@ import argparse
 import json
 import os
 import sys
-
+from dataclasses import dataclass
 
 
 import logging
-from typing import Dict, Any
+from enum import Enum
+from typing import Dict, Any, List
 from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
@@ -847,7 +848,89 @@ class PhotoEditor:
         cropped = self.apply_crop(self.original_image, crop_data)
         return self.run_parallel_pipeline(cropped, preset)
 
+
+@dataclass(frozen=True)
+class TonemapCurves:
+    """Stores the 5-point Y-value float lists (at x = 0.0, 0.25, 0.5, 0.75, 1.0) for a film profile."""
+    master: List[float]
+    red: List[float]
+    green: List[float]
+    blue: List[float]
+
+    def to_dict(self) -> Dict[str, List[float]]:
+        return {
+            "master": self.master,
+            "r": self.red,
+            "g": self.green,
+            "b": self.blue,
+        }
+
+
+class FilmProfile(Enum):
+    """Enum representing film tonemap profiles with 5-point curve evaluation data."""
     
+
+    PORTRA_400 = TonemapCurves(
+        master=[0.04, 0.28, 0.52, 0.76, 0.97],
+        red=[0.05, 0.30, 0.55, 0.79, 0.98],
+        green=[0.04, 0.28, 0.52, 0.76, 0.97],
+        blue=[0.06, 0.26, 0.48, 0.73, 0.94],
+    )
+
+    VELVIA_50 = TonemapCurves(
+        master=[0.00, 0.18, 0.50, 0.84, 1.00],
+        red=[0.00, 0.20, 0.54, 0.86, 1.00],
+        green=[0.00, 0.18, 0.51, 0.85, 1.00],
+        blue=[0.02, 0.20, 0.48, 0.80, 0.98],
+    )
+
+    KODACHROME_64 = TonemapCurves(
+        master=[0.01, 0.22, 0.51, 0.78, 0.96],
+        red=[0.02, 0.26, 0.56, 0.82, 0.98],
+        green=[0.01, 0.22, 0.51, 0.77, 0.95],
+        blue=[0.01, 0.19, 0.46, 0.71, 0.90],
+    )
+
+    SUPERIA_400 = TonemapCurves(
+        master=[0.03, 0.25, 0.52, 0.78, 0.98],
+        red=[0.03, 0.26, 0.52, 0.77, 0.98],
+        green=[0.04, 0.27, 0.54, 0.79, 0.99],
+        blue=[0.05, 0.26, 0.49, 0.75, 0.96],
+    )
+
+    @property
+    def master(self) -> List[float]:
+        """Returns the Master (Luminance) curve Y values."""
+        return self.value.master
+
+    @property
+    def red(self) -> List[float]:
+        """Returns the Red channel curve Y values."""
+        return self.value.red
+
+    @property
+    def green(self) -> List[float]:
+        """Returns the Green channel curve Y values."""
+        return self.value.green
+
+    @property
+    def blue(self) -> List[float]:
+        """Returns the Blue channel curve Y values."""
+        return self.value.blue
+
+    def get_curve(self, channel: str) -> List[float]:
+        """Safely fetches a curve list by channel name ('master', 'red', 'green', 'blue')."""
+        channel_map = self.value.to_dict()
+        key = channel.lower().strip()
+        if key not in channel_map:
+            raise ValueError(
+                f"Invalid channel '{channel}'. Must be one of: {list(channel_map.keys())}"
+            )
+        return channel_map[key]
+
+    def all_curves(self) -> Dict[str, List[float]]:
+        """Returns a dictionary of all 4 channel curves for serialization or iteration."""
+        return self.value.to_dict()
 
 
 def export_photo(img_array: np.ndarray, output_path: str, preset: Dict[str, Any], max_mb: float = 8.0):

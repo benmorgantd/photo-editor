@@ -8,6 +8,7 @@ import traceback
 import sys
 import os
 import json
+import time
 import datetime
 import tempfile
 import configparser
@@ -32,10 +33,10 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QSplitter, QTreeView, QGraphicsView, QGraphicsScene, QPushButton,
     QSlider, QCheckBox, QComboBox, QLabel, QGroupBox, QScrollArea, QFileDialog,
-    QFrame, QLineEdit, QMenu, QProgressDialog, QMessageBox, QGraphicsPixmapItem, QRadioButton, QButtonGroup
+    QFrame, QLineEdit, QMenu, QProgressDialog, QMessageBox, QGraphicsPixmapItem, QRadioButton, QButtonGroup, QDoubleSpinBox, QSizePolicy
 )
 
-from photo_editor_core import PhotoEditor, export_photo, SUPPORTED_EXTENSIONS, RAW_EXTENSIONS
+from photo_editor_core import PhotoEditor, export_photo, SUPPORTED_EXTENSIONS, RAW_EXTENSIONS, FilmProfile
 
 # Setup persistent file logging locations locally inside specific subfolder structures
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) or os.getcwd()
@@ -442,7 +443,7 @@ class ZoomableGraphicsView(QGraphicsView):
         
         # TODO: center in view as well
         self.fitInView(scene_rect, Qt.AspectRatioMode.KeepAspectRatio)
-        self.centerOn(scene_rect.center())
+        # self.centerOn(scene_rect.center())
 
 # ---------------------------------------------------------
 # Native 1D Natural Cubic Spline Interpolation Solver
@@ -498,33 +499,39 @@ def solve_natural_cubic_spline(x, y):
 # ---------------------------------------------------------
 # Custom Interactive Curves Widget
 # ---------------------------------------------------------
-class CurveEditorWidget(QWidget):
-    # Signals emitting (channel, point_index, value)
-    # channel is 'r', 'g', or 'b'
-    # value is a float 0.0 - 1.0
+class CurveCanvas(QWidget):
+    """Internal canvas widget dedicated solely to rendering and mouse interaction."""
     pointDragged = pyqtSignal(str, int, float)
     pointReleased = pyqtSignal(str, int, float)
+    selectionChanged = pyqtSignal(object)  # Emits int index or None
+    pointMovedLive = pyqtSignal(float)     # Emits Y value during drag for UI sync
+
+    DEFAULT_CURVE_VALS = [0.0, 0.25, 0.5, 0.75, 1.0]
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(350, 350)
+        self.setMinimumSize(300, 300)
         self.setMouseTracking(True)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         
-        # 5 fixed X coordinates for the control points (0.0 to 1.0)
-        self.x_points = [0.0, 0.25, 0.5, 0.75, 1.0]
-        
-        # Initial Y values (linear default)
+        self.x_points = self.DEFAULT_CURVE_VALS.copy()
         self.curves = {
-            'r': [0.0, 0.25, 0.5, 0.75, 1.0],
-            'g': [0.0, 0.25, 0.5, 0.75, 1.0],
-            'b': [0.0, 0.25, 0.5, 0.75, 1.0]
+            'r': self.DEFAULT_CURVE_VALS.copy(),
+            'g': self.DEFAULT_CURVE_VALS.copy(),
+            'b': self.DEFAULT_CURVE_VALS.copy()
         }
         
         self.current_channel = 'r'
-        self.active_point_idx = None
+        self.selected_idx = None
         self.hover_point_idx = None
+        self.is_dragging = False
         
-        # Margin around the drawing canvas in pixels
+        # Throttling configuration
+        self.min_val_delta = 0.005      # Minimum Y value change required to emit
+        self.min_time_delta = 0.033     # Minimum time (seconds) between emits (~60Hz)
+        self._last_emit_time = 0.0
+        self._last_emitted_val = None
+        
         self.margin = 30
         self.point_radius = 6
 
@@ -532,93 +539,103 @@ class CurveEditorWidget(QWidget):
         if channel in ['r', 'g', 'b']:
             self.current_channel = channel
             self.hover_point_idx = None
-            self.active_point_idx = None
             self.update()
 
     def get_curves_dict(self):
-        """Returns the dictionary representation requested:
-        { 'r': [y0, y1, y2, y3, y4], 'g': [...], 'b': [...] }
-        """
         return {ch: list(self.curves[ch]) for ch in ['r', 'g', 'b']}
+
+    def set_curve_values(self, r_vals, g_vals, b_vals):
+        for channel, vals in [('r', r_vals), ('g', g_vals), ('b', b_vals)]:
+            if len(vals) != 5:
+                raise ValueError(f"Each channel must have exactly 5 points. Got {len(vals)} for '{channel}'.")
+            self.curves[channel] = [max(0.0, min(1.0, float(v))) for v in vals]
+        
+        self.selected_idx = None
+        self.hover_point_idx = None
+        self.selectionChanged.emit(None)
+        self.update()
+
+    def set_selected_point_y(self, val):
+        """Called when the user edits the Y spinbox manually."""
+        if self.selected_idx is not None:
+            clamped_val = max(0.0, min(1.0, float(val)))
+            self.curves[self.current_channel][self.selected_idx] = clamped_val
+            self.pointDragged.emit(self.current_channel, self.selected_idx, clamped_val)
+            self.pointReleased.emit(self.current_channel, self.selected_idx, clamped_val)
+            self.update()
 
     # --- Geometry Mapping Helpers ---
     def _canvas_rect(self):
-        """Returns the inner square where the curve is active."""
-        w = self.width()
-        h = self.height()
+        w, h = self.width(), self.height()
         size = min(w, h) - (self.margin * 2)
         x_offset = (w - size) / 2
         y_offset = (h - size) / 2
         return QRectF(x_offset, y_offset, size, size)
 
     def _to_pixels(self, norm_x, norm_y, rect):
-        """Converts normalized (0-1) coordinates to screen pixels."""
         px = rect.left() + norm_x * rect.width()
-        # Invert Y because screen space 0 is at the top, but tone curves 0 is at the bottom
         py = rect.bottom() - norm_y * rect.height()
         return QPointF(px, py)
 
     def _to_normalized_y(self, pixel_y, rect):
-        """Converts raw screen pixel Y back to normalized float (0.0 - 1.0)."""
         norm_y = (rect.bottom() - pixel_y) / rect.height()
         return max(0.0, min(1.0, norm_y))
-
-    def set_curve_values(self, r_vals, g_vals, b_vals):
-        """
-        Updates the coordinate points of the editor from code.
-        Accepts three lists/iterables of 5 float values each.
-        """
-        print(r_vals)
-        # Quick validation to keep the editor from breaking on malformed values
-        for channel, vals in [('r', r_vals), ('g', g_vals), ('b', b_vals)]:
-            if len(vals) != 5:
-                raise ValueError(f"Each channel must have exactly 5 points. Got {len(vals)} for '{channel}'.")
-            
-            # Convert to float and clamp to 0.0 - 1.0 range
-            self.curves[channel] = [max(0.0, min(1.0, float(v))) for v in vals]
-        
-        # Reset current drag/hover states since we are loading a fresh state
-        self.active_point_idx = None
-        self.hover_point_idx = None
-        
-        # Force the widget to repaint itself with the new curves
-        self.update()
 
     # --- Mouse Events ---
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             rect = self._canvas_rect()
             mouse_pos = event.position()
-            
-            # Check if clicking on one of the 5 points (fixed X)
             y_vals = self.curves[self.current_channel]
+            
+            hit_idx = None
             for i in range(5):
                 pt_pixels = self._to_pixels(self.x_points[i], y_vals[i], rect)
-                distance = (mouse_pos - pt_pixels).manhattanLength()
-                if distance < 15: # Hitbox threshold
-                    self.active_point_idx = i
+                if (mouse_pos - pt_pixels).manhattanLength() < 15:
+                    hit_idx = i
                     break
+            
+            self.selected_idx = hit_idx
+            self.selectionChanged.emit(hit_idx)
+            
+            if hit_idx is not None:
+                self.is_dragging = True
+                self._last_emitted_val = y_vals[hit_idx]
+                self._last_emit_time = time.monotonic()
+            
+            self.update()
 
     def mouseMoveEvent(self, event):
         rect = self._canvas_rect()
         mouse_pos = event.position()
         y_vals = self.curves[self.current_channel]
         
-        # If we are dragging a point
-        if self.active_point_idx is not None:
+        if self.is_dragging and self.selected_idx is not None:
             norm_y = self._to_normalized_y(mouse_pos.y(), rect)
-            self.curves[self.current_channel][self.active_point_idx] = norm_y
-            self.pointDragged.emit(self.current_channel, self.active_point_idx, norm_y)
+            self.curves[self.current_channel][self.selected_idx] = norm_y
+            
+            # Always sync UI spinbox during drag
+            self.pointMovedLive.emit(norm_y)
+            
+            # Evaluate throttle gates
+            current_time = time.monotonic()
+            time_delta = current_time - self._last_emit_time
+            val_delta = abs(norm_y - (self._last_emitted_val if self._last_emitted_val is not None else 0.0))
+            
+            if val_delta >= self.min_val_delta and time_delta >= self.min_time_delta:
+                self.pointDragged.emit(self.current_channel, self.selected_idx, norm_y)
+                self._last_emit_time = current_time
+                self._last_emitted_val = norm_y
+                
             self.update()
             return
             
-        # Otherwise, check for hover states to change cursor/appearance
+        # Hover logic when not dragging
         old_hover = self.hover_point_idx
         self.hover_point_idx = None
         for i in range(5):
             pt_pixels = self._to_pixels(self.x_points[i], y_vals[i], rect)
-            distance = (mouse_pos - pt_pixels).manhattanLength()
-            if distance < 12:
+            if (mouse_pos - pt_pixels).manhattanLength() < 12:
                 self.hover_point_idx = i
                 self.setCursor(Qt.CursorShape.SizeVerCursor)
                 break
@@ -630,63 +647,51 @@ class CurveEditorWidget(QWidget):
             self.update()
 
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and self.active_point_idx is not None:
-            released_idx = self.active_point_idx
-            final_val = self.curves[self.current_channel][released_idx]
-            self.active_point_idx = None
-            self.pointReleased.emit(self.current_channel, released_idx, final_val)
+        if event.button() == Qt.MouseButton.LeftButton and self.is_dragging:
+            self.is_dragging = False
+            if self.selected_idx is not None:
+                final_val = self.curves[self.current_channel][self.selected_idx]
+                
+                # Guarantee downstream sync if throttled out on the last micro-movement
+                if final_val != self._last_emitted_val:
+                    self.pointDragged.emit(self.current_channel, self.selected_idx, final_val)
+                
+                self.pointReleased.emit(self.current_channel, self.selected_idx, final_val)
             self.update()
 
     # --- Drawing Logic ---
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
         rect = self._canvas_rect()
         
-        # Draw dark grid background
         painter.fillRect(rect, QColor(25, 25, 25))
         
-        # Draw standard photography Grid lines (Quarter boundaries)
         grid_pen = QPen(QColor(60, 60, 60), 1, Qt.PenStyle.DashLine)
         painter.setPen(grid_pen)
         for val in [0.25, 0.5, 0.75]:
-            # Vertical lines
-            pt_top = self._to_pixels(val, 1.0, rect)
-            pt_bottom = self._to_pixels(val, 0.0, rect)
-            painter.drawLine(pt_top, pt_bottom)
-            
-            # Horizontal lines
-            pt_left = self._to_pixels(0.0, val, rect)
-            pt_right = self._to_pixels(1.0, val, rect)
-            painter.drawLine(pt_left, pt_right)
+            painter.drawLine(self._to_pixels(val, 1.0, rect), self._to_pixels(val, 0.0, rect))
+            painter.drawLine(self._to_pixels(0.0, val, rect), self._to_pixels(1.0, val, rect))
 
-        # Draw outer boundary border
         border_pen = QPen(QColor(90, 90, 90), 1, Qt.PenStyle.SolidLine)
         painter.setPen(border_pen)
         painter.drawRect(rect)
         
-        # Draw raw channel background diagonal linear lines as reference guides
         guide_pen = QPen(QColor(50, 50, 50), 1, Qt.PenStyle.SolidLine)
         painter.setPen(guide_pen)
         painter.drawLine(self._to_pixels(0.0, 0.0, rect), self._to_pixels(1.0, 1.0, rect))
 
-        # Color palette depending on the active channel
         channel_colors = {
-            'r': (QColor(235, 75, 75), QColor(235, 75, 75, 60)),
-            'g': (QColor(75, 215, 75), QColor(75, 215, 75, 60)),
-            'b': (QColor(75, 140, 245), QColor(75, 140, 245, 60))
+            'r': QColor(235, 75, 75),
+            'g': QColor(75, 215, 75),
+            'b': QColor(75, 140, 245)
         }
-        line_color, shadow_color = channel_colors[self.current_channel]
+        line_color = channel_colors[self.current_channel]
 
-        # Draw the curve line
         y_vals = self.curves[self.current_channel]
         spline_eval = solve_natural_cubic_spline(self.x_points, y_vals)
         
-        curve_pen = QPen(line_color, 2, Qt.PenStyle.SolidLine)
-        painter.setPen(curve_pen)
-        
-        # Sample points on curve to build path
+        painter.setPen(QPen(line_color, 2, Qt.PenStyle.SolidLine))
         resolution = 100
         x_samples = np.linspace(0.0, 1.0, resolution)
         y_samples = spline_eval(x_samples)
@@ -696,18 +701,17 @@ class CurveEditorWidget(QWidget):
             p2 = self._to_pixels(x_samples[idx+1], y_samples[idx+1], rect)
             painter.drawLine(p1, p2)
 
-        # Draw the 5 interactive control points
         for i in range(5):
             pt = self._to_pixels(self.x_points[i], y_vals[i], rect)
             
-            # Design visual states for point interactions (Active / Hover / Standard)
-            if i == self.active_point_idx:
+            # Distinct visual priority: Selected > Hover > Standard
+            if i == self.selected_idx:
                 painter.setBrush(QBrush(line_color))
-                painter.setPen(QPen(QColor(255, 255, 255), 2))
-                r = self.point_radius + 2
+                painter.setPen(QPen(QColor(255, 255, 255), 2.5))
+                r = self.point_radius + 3
             elif i == self.hover_point_idx:
                 painter.setBrush(QBrush(line_color))
-                painter.setPen(QPen(QColor(240, 240, 240), 1.5))
+                painter.setPen(QPen(QColor(220, 220, 220), 1.5))
                 r = self.point_radius + 1.5
             else:
                 painter.setBrush(QBrush(QColor(30, 30, 30)))
@@ -716,6 +720,89 @@ class CurveEditorWidget(QWidget):
                 
             painter.drawEllipse(pt, r, r)
 
+
+# ---------------------------------------------------------
+# Main Wrapper Widget (Exposes Original API + Control Bar)
+# ---------------------------------------------------------
+class CurveEditorWidget(QWidget):
+    pointDragged = pyqtSignal(str, int, float)
+    pointReleased = pyqtSignal(str, int, float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(350, 380)
+        
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(4)
+        
+        # --- Top Control Bar ---
+        control_layout = QHBoxLayout()
+        control_layout.setContentsMargins(10, 5, 10, 0)
+        
+        self.x_label = QLabel("X:")
+        self.x_spin = QDoubleSpinBox()
+        self.x_spin.setRange(0.0, 1.0)
+        self.x_spin.setDecimals(3)
+        self.x_spin.setEnabled(False) # X is permanently locked
+        
+        self.y_label = QLabel("Y:")
+        self.y_spin = QDoubleSpinBox()
+        self.y_spin.setRange(0.0, 1.0)
+        self.y_spin.setDecimals(3)
+        self.y_spin.setSingleStep(0.01)
+        self.y_spin.setEnabled(False) # Enabled only when point selected
+        
+        control_layout.addWidget(self.x_label)
+        control_layout.addWidget(self.x_spin)
+        control_layout.addSpacing(15)
+        control_layout.addWidget(self.y_label)
+        control_layout.addWidget(self.y_spin)
+        control_layout.addStretch()
+        
+        # --- Canvas ---
+        self.canvas = CurveCanvas(self)
+        
+        main_layout.addLayout(control_layout)
+        main_layout.addWidget(self.canvas)
+        
+        # --- Signal Routing ---
+        self.canvas.pointDragged.connect(self.pointDragged.emit)
+        self.canvas.pointReleased.connect(self.pointReleased.emit)
+        self.canvas.selectionChanged.connect(self._on_selection_changed)
+        self.canvas.pointMovedLive.connect(self._update_y_spinbox_silent)
+        self.y_spin.valueChanged.connect(self.canvas.set_selected_point_y)
+
+    def _on_selection_changed(self, idx):
+        if idx is None:
+            self.x_spin.setValue(0.0)
+            self._update_y_spinbox_silent(0.0)
+            self.y_spin.setEnabled(False)
+        else:
+            self.x_spin.setValue(self.canvas.x_points[idx])
+            current_y = self.canvas.curves[self.canvas.current_channel][idx]
+            self._update_y_spinbox_silent(current_y)
+            self.y_spin.setEnabled(True)
+
+    def _update_y_spinbox_silent(self, val):
+        """Updates spinbox text without triggering valueChanged signal back to canvas."""
+        self.y_spin.blockSignals(True)
+        self.y_spin.setValue(val)
+        self.y_spin.blockSignals(False)
+
+    # --- Proxy Public API Methods ---
+    def set_channel(self, channel):
+        self.canvas.set_channel(channel)
+        # Refresh spinbox if a point was already selected when switching channels
+        if self.canvas.selected_idx is not None:
+            new_y = self.canvas.curves[self.canvas.current_channel][self.canvas.selected_idx]
+            self._update_y_spinbox_silent(new_y)
+
+    def get_curves_dict(self):
+        return self.canvas.get_curves_dict()
+
+    def set_curve_values(self, r_vals, g_vals, b_vals):
+        self.canvas.set_curve_values(r_vals, g_vals, b_vals)
 
 class MainWindow(QMainWindow):
     """Main window object orchestrates user interface layout structures.
@@ -743,6 +830,8 @@ class MainWindow(QMainWindow):
         QApplication.instance().setWindowIcon(QIcon(icon_pixmap))
         self.setWindowTitle("Free Python Desktop Photo Editor by Ben Morgan")
         self.resize(1600, 950)
+
+        self.default_curve_vals = [0.0, 0.25, 0.5, 0.75, 1.0]
 
         self.thread_pool = QThreadPool.globalInstance()
 
@@ -911,6 +1000,24 @@ class MainWindow(QMainWindow):
         paste_settings_action.triggered.connect(self._paste_edit_settings)
         edit_menu.addAction(paste_settings_action)
 
+        apply_profiles_menu = edit_menu.addMenu('&Apply Film Profile')
+
+        portra_400_action = QAction('&Portra 400', self)
+        portra_400_action.triggered.connect(lambda: self._apply_film_profile(FilmProfile.PORTRA_400))
+        apply_profiles_menu.addAction(portra_400_action)
+
+        velvia_50_Action = QAction('&Velvia 50', self)
+        velvia_50_Action.triggered.connect(lambda: self._apply_film_profile(FilmProfile.VELVIA_50))
+        apply_profiles_menu.addAction(velvia_50_Action)
+
+        kodachrome_64_action = QAction('&Kodachrome 64', self)
+        kodachrome_64_action.triggered.connect(lambda: self._apply_film_profile(FilmProfile.KODACHROME_64))
+        apply_profiles_menu.addAction(kodachrome_64_action)
+
+        superia_400_action = QAction('&Superia 400', self)
+        superia_400_action.triggered.connect(lambda: self._apply_film_profile(FilmProfile.SUPERIA_400))
+        apply_profiles_menu.addAction(superia_400_action)
+
         tools_menu = menu_bar.addMenu("&Tools")
 
         self.highlight_clipped_action = QAction("&Highlight Clipped Pixels", self)
@@ -1001,6 +1108,31 @@ class MainWindow(QMainWindow):
         self._apply_preset_to_ui()
         self._save_current_edits_to_session_cache()
         self.statusBar().showMessage("Preset configurations injected onto active workspace matrix.")
+    
+    def _apply_film_profile(self, profile):
+        if profile is None:
+            self.preset['rgb_curves'] = PhotoEditor.DEFAULT_PRESET['rgb_curves']
+        else:
+            self.preset.setdefault('rgb_curves', PhotoEditor.DEFAULT_PRESET['rgb_curves'])
+            for color in ['r', 'g', 'b']:
+                curve_values = profile.get_curve(color)
+                self.preset['rgb_curves'][color][1] = curve_values
+        
+        self._apply_preset_to_ui()
+        self._save_current_edits_to_session_cache()
+    
+    def _profiles_combobox_changed(self, text):
+        if text == 'None':
+            self._apply_film_profile(None)
+            return
+        elif text == 'Portra 400':
+            self._apply_film_profile(FilmProfile.PORTRA_400)
+        elif text == 'Velvia 50':
+            self._apply_film_profile(FilmProfile.VELVIA_50)
+        elif text == 'Kodachrome 64':
+            self._apply_film_profile(FilmProfile.KODACHROME_64)
+        elif text == 'Superia 400':
+            self._apply_film_profile(FilmProfile.SUPERIA_400)
 
     def _load_file_status_registry(self):
         """Parses local tracking data configurations to update view states."""
@@ -1442,6 +1574,22 @@ class MainWindow(QMainWindow):
 
         # Channel Selectors
         g_curves = CollapsibleGroupBox("RGB Curves")
+
+        # Combo box for common profiles
+        profile_preset_hlayout = QHBoxLayout()
+        profile_preset_hlayout.addWidget(QLabel('Curve Film Profile Presets: '))
+        profiles_combobox = QComboBox()
+        profiles_combobox.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        profiles_combobox.addItem('None')
+        profiles_combobox.addItem('Portra 400')
+        profiles_combobox.addItem('Velvia 50')
+        profiles_combobox.addItem('Kodachrome 64')
+        profiles_combobox.addItem('Superia 400')
+        profiles_combobox.currentTextChanged.connect(self._profiles_combobox_changed)
+        profile_preset_hlayout.addWidget(profiles_combobox)
+
+        g_curves.content_layout.addLayout(profile_preset_hlayout)
+
         channel_layout = QHBoxLayout()
         self.btn_group = QButtonGroup(self)
         
@@ -1456,7 +1604,6 @@ class MainWindow(QMainWindow):
             btn.clicked.connect(lambda checked, c=code: self.curve_editor.set_channel(c))
         
         g_curves.content_layout.addLayout(channel_layout)
-        
         
         # Interactive Editor Canvas
         self.curve_editor = CurveEditorWidget()
@@ -1716,12 +1863,12 @@ class MainWindow(QMainWindow):
         self.sliders_map["saturation"].setValue(int(self.preset.get("saturation", 0.0) * 100))
 
         # rgb curves
-        default_curve = [0.0, 0.25, 0.5, 0.75, 1.0]
+        
         rgb_curves = self.preset.get('rgb_curves')
         if rgb_curves:
             self.sliders_map['rgb_curves'].set_curve_values(rgb_curves['r'][1], rgb_curves['g'][1], rgb_curves['b'][1])
         else:
-            self.sliders_map['rgb_curves'].set_curve_values(default_curve, default_curve, default_curve)
+            self.sliders_map['rgb_curves'].set_curve_values(self.default_curve_vals, self.default_curve_vals, self.default_curve_vals)
 
         color_adj = self.preset.get("color_adjustments", {})
         active_color_bands = ["red", "orange", "yellow", "green", "aqua", "blue", "purple", "magenta"]
