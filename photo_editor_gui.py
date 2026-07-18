@@ -161,15 +161,16 @@ class ImageLoaderSignals(QObject):
 
 class FullResLoaderWorker(QRunnable):
     """Worker task that decodes full-resolution matrices in a background thread pool."""
-    def __init__(self, file_path: str):
+    def __init__(self, file_path: str, view_width: int):
         super().__init__()
         self.file_path = file_path
         self.signals = ImageLoaderSignals()
+        self.view_width = view_width
 
     def run(self):
         try:
             # This heavy I/O and matrix decoding now runs off the main event loop
-            matrix = PhotoEditor.load_image_matrix(self.file_path, preview=False)
+            matrix = PhotoEditor.load_image_matrix(self.file_path, preview=True, max_width=min(1024, self.view_width))
             self.signals.finished.emit(self.file_path, matrix)
         except Exception as e:
             err_msg = f"{e}\n{traceback.format_exc()}"
@@ -404,7 +405,7 @@ class CollapsibleGroupBox(QGroupBox):
             self.content_widget.show()
             self.toggle_btn.setText("▼ Collapse Panel Layer")
 
-
+# TODO: fit frame to view method and alt+rc zooming
 class ZoomableGraphicsView(QGraphicsView):
     """Viewport container supporting mouse wheel zooming and click-and-drag panning."""
 
@@ -425,25 +426,46 @@ class ZoomableGraphicsView(QGraphicsView):
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
 
     def wheelEvent(self, event):
-        """Applies scalable matrix multipliers to adjust viewport magnification.
-
-        Args:
-            event (QWheelEvent): Input location angle parameter wrapper blocks.
-        """
-        zoom_factor = (1 + self.ZOOM_SENSITIVITY) if event.angleDelta().y() > 0 else (1 - self.ZOOM_SENSITIVITY)
-        self.scale(zoom_factor, zoom_factor)
+        # Calculate zoom factor
+        factor = 1.1 if event.angleDelta().y() > 0 else 0.9
+        
+        # Save the scene position before scaling
+        pos_before = self.mapToScene(event.position().toPoint())
+        
+        # Scale the view
+        self.scale(factor, factor)
+        
+        # Map the mouse position to scene again and adjust center 
+        # to keep the mouse anchored to the same spot
+        pos_after = self.mapToScene(event.position().toPoint())
+        delta = pos_after - pos_before
+        self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - int(delta.x()))
+        self.verticalScrollBar().setValue(self.verticalScrollBar().value() - int(delta.y()))
     
     def zoom_to_fit(self):
-        if not self.scene():
+        scene = self.scene()
+        if not scene:
             return
-        
-        scene_rect = self.scene().sceneRect()
-        if scene_rect.isNull():
+
+        # Use the actual bounding box of the contents, not the scene's container
+        content_rect = scene.itemsBoundingRect()
+        if content_rect.isNull():
             return
-        
-        # TODO: center in view as well
-        self.fitInView(scene_rect, Qt.AspectRatioMode.KeepAspectRatio)
-        # self.centerOn(scene_rect.center())
+
+        # 1. Temporarily disable anchors
+        anchor = self.transformationAnchor()
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
+
+        # 2. Reset the transformation matrix to identity so fitInView 
+        #    calculates from a "clean" scale of 1.0
+        self.resetTransform()
+
+        # 3. Fit the view to the items, not the scene container
+        #    Add a small margin (e.g., 0.95) if you don't want it touching edges
+        self.fitInView(content_rect, Qt.AspectRatioMode.KeepAspectRatio)
+
+        # 4. Restore original anchor
+        self.setTransformationAnchor(anchor)
 
 # ---------------------------------------------------------
 # Native 1D Natural Cubic Spline Interpolation Solver
@@ -835,6 +857,9 @@ class MainWindow(QMainWindow):
 
         self.thread_pool = QThreadPool.globalInstance()
 
+        # Create a cache of the image matrices we load. These never change, even after edits.
+        self.image_matrix_cache = dict()
+
         self.history_registry = dict()
 
         self.current_file_path = ""
@@ -889,8 +914,7 @@ class MainWindow(QMainWindow):
     @property
     def active_crop_variant(self):
         return self.preset.get('active_crop_variant', 'default')
-
-
+    
     def _get_preset_manifest_filepath_for_image(self, image_filepath: str) -> str:
         # combine the folder it's from and the file's name for a more unique name
         folder_name = image_filepath.split('/')[-2].replace(' ', '_')
@@ -1414,7 +1438,13 @@ class MainWindow(QMainWindow):
                 
                 logger.info(f'Applying auto edits to {file_name}')
 
-                preview_matrix = PhotoEditor.load_image_matrix(file_path, preview=True)
+                # auto-edits is going to scale down to 512 anyway.
+                if file_path in self.image_matrix_cache:
+                    preview_matrix = self.image_matrix_cache[file_path]['preview_matrix']
+                else:
+                    preview_matrix = PhotoEditor.load_image_matrix(file_path, preview=True, max_width=512)
+                    self.image_matrix_cache[file_path]['preview_matrix'] = preview_matrix
+
                 auto_edit_results = PhotoEditor.calculate_auto_preset(preview_matrix)
 
                 preset = PhotoEditor.DEFAULT_PRESET.copy()
@@ -1455,6 +1485,9 @@ class MainWindow(QMainWindow):
 
     def _render_stationary_pane(self):
         """Extracts and scales image data to fit the lower left-hand column preview thumbnail."""
+        # TODO: when we set a folder root, we can calculate all these thumbnails in a background thread.
+        # Then when we switch we can just load from a cache.
+        # TODO: separate this into a static method for generating the thumbnail, then this checks the cache.
         if not self.preview_target_path or not os.path.exists(self.preview_target_path):
             return
         try:
@@ -1911,6 +1944,7 @@ class MainWindow(QMainWindow):
 
     def _apply_preset_to_ui(self):
         """Maps parameters sequentially across GUI element items, blocking nested validation loops."""
+        # When is_updating_ui is True, we won't apply the preset 100's of times (signals are essentially disconnected)
         self.is_updating_ui = True
 
         # Add all crop variants
@@ -2132,6 +2166,9 @@ class MainWindow(QMainWindow):
             self.tree_view.setRootIndex(self.file_model.index(selected_dir))
             self._save_browsing_directory_state(selected_dir)
             self.statusBar().showMessage(f"Tree viewport root path set to: {selected_dir}")
+        
+        # TODO: load the _proxy_ matrices only for the next 10 files
+        # TODO: start a thread loading the thumbnails for all files
 
     def _on_file_selected(self, index: QModelIndex):
         """Loads data matrices from newly activated tree folder navigation index items.
@@ -2139,6 +2176,7 @@ class MainWindow(QMainWindow):
         Args:
             index (QModelIndex): Target selection tracking index token layout parameters.
         """
+        start = time.time()
         path = self.file_model.filePath(index)
         if os.path.isdir(path): return
 
@@ -2155,12 +2193,19 @@ class MainWindow(QMainWindow):
                 return
             
             # 1. Load ONLY the fast proxy synchronously on the UI thread
-            self.proxy_matrix = PhotoEditor.load_image_matrix(path, preview=True, max_width=800)
+            stored_proxy_matrix = self.image_matrix_cache.get(self.current_file_path, dict()).get('proxy_matrix')
+            if stored_proxy_matrix is not None:
+                self.proxy_matrix = stored_proxy_matrix.copy()
+            else:
+                self.proxy_matrix = PhotoEditor.load_image_matrix(self.current_file_path, preview=True, max_width=min(self.view.width(), 512))
+                self.image_matrix_cache.setdefault(self.current_file_path, dict())
+                self.image_matrix_cache[self.current_file_path]['proxy_matrix'] = self.proxy_matrix.copy()
             
             # Temporarily point preview_matrix to the proxy so the UI renders immediately
-            self.preview_matrix = self.proxy_matrix 
+            self.preview_matrix = self.proxy_matrix
             self.preset = self._read_preset_from_manifest(path)
 
+            # TODO: we could cache this metadata
             # 2. Extract lightweight metadata (fast I/O only, avoid deep decoding)
             if ext in [e.lower() for e in RAW_EXTENSIONS]:
                 if not HAS_RAWPY_GUI:
@@ -2171,7 +2216,7 @@ class MainWindow(QMainWindow):
                 with Image.open(path) as img:
                     img = ImageOps.exif_transpose(img)
                     orig_w, orig_h = img.size
-
+            
             self.lbl_info_name.setText(f"Name: {os.path.basename(path)}")
             self.lbl_info_res.setText(f"Original Resolution: {orig_w} x {orig_h}")
             
@@ -2183,12 +2228,20 @@ class MainWindow(QMainWindow):
             self.lbl_info_size.setText(f"File Disk Size: {size_mb:.2f} MB")
             
             # 3. Apply presets and render the proxy immediately
-            self._apply_preset_to_ui()
+            self._apply_preset_to_ui()  # This is the longest time.
             self._zoom_to_fit()
             self._save_browsing_directory_state(os.path.dirname(path))
 
             # 4. Dispatch the background task for the full-resolution matrix
-            self._start_background_fullres_load(path)
+            stored_preview_matrix = self.image_matrix_cache.get(self.current_file_path, dict()).get('preview_matrix')
+            if stored_preview_matrix is not None:
+                print('using preview matrix')
+                self.preview_matrix = stored_preview_matrix.copy()
+            else:
+                print('starting preview matrix background load')
+                self._start_background_fullres_load(path)
+
+            # TODO: start a thread loading the proxy matrices for the surrounding 10 files in the tree
 
         except Exception as e:
             logger.error(f"Critical load validation exception encountered: {e}")
@@ -2198,10 +2251,11 @@ class MainWindow(QMainWindow):
             self.proxy_matrix = None
         finally:
             QApplication.restoreOverrideCursor()
+            print(f'On file selected time: {time.time() - start}')
 
     def _start_background_fullres_load(self, path: str):
         """Spawns a background thread to load the full-res matrix without blocking the UI."""
-        worker = FullResLoaderWorker(path)
+        worker = FullResLoaderWorker(path, self.view.width())
         worker.signals.finished.connect(self._on_fullres_load_complete)
         worker.signals.error.connect(self._on_fullres_load_error)
         self.thread_pool.start(worker)
@@ -2215,6 +2269,8 @@ class MainWindow(QMainWindow):
 
         logger.info(f"Background full-res load complete for: {loaded_path}")
         self.preview_matrix = full_matrix
+        self.image_matrix_cache.setdefault(self.current_file_path, dict())
+        self.image_matrix_cache[self.current_file_path]['preview_matrix'] = self.preview_matrix.copy()
         
         # Trigger a silent refresh of your viewport with the high-resolution data
         self._refresh_viewport()
@@ -2248,8 +2304,9 @@ class MainWindow(QMainWindow):
         if self.show_original_state:
             render_array = source_matrix
         else:
-            cropped_preview = PhotoEditor.apply_crop(source_matrix, self.active_crop_data)
-            render_array = PhotoEditor.run_parallel_pipeline(cropped_preview, self.preset)
+            # TODO: we could probably cache the cropped preview if crop data hasn't changed.
+            cropped_preview = PhotoEditor.apply_crop(source_matrix, self.active_crop_data)  # This takes no time
+            render_array = PhotoEditor.run_parallel_pipeline(cropped_preview, self.preset)  # This takes 4 seconds
 
         # Trigger histogram asynchronously or on downsampled data to prevent UI blocks
         self.histogram_widget.render_histogram(render_array)
@@ -2282,14 +2339,8 @@ class MainWindow(QMainWindow):
         q_image = QImage(img_uint8.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
         
         # 5. Update persistent item instead of clearing scene
-        self.pixmap_item.setPixmap(QPixmap.fromImage(q_image))
+        self.pixmap_item.setPixmap(QPixmap.fromImage(q_image))  # This takes little time
 
-        # Only resize scene and re-zoom if the output dimensions actually changed
-        # if (w, h) != self._current_view_size:
-        #     self.scene.setSceneRect(QRectF(0, 0, w, h))
-        #     self.view.zoom_to_fit()
-        #     self._current_view_size = (w, h)
-    
     def _zoom_to_fit(self):
         self.view.zoom_to_fit()
 

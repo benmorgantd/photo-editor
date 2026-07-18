@@ -357,6 +357,7 @@ class PhotoEditor:
             0.0
         ).astype(np.float32)
 
+    # TODO: this is getting heavier and heavier as we continue to add steps. We need to do lazy caching here.
     @classmethod
     def run_pipeline(cls, src_matrix: np.ndarray, preset: Dict[str, Any]) -> np.ndarray:
         """Executes core image filters sequentially using in-place operations.
@@ -398,6 +399,8 @@ class PhotoEditor:
         exposure = preset.get('exposure', 0.0)
         if exposure != 0.0:
             img *= np.float32(2.0 ** exposure)
+
+        return img
 
         # 3. Contrast (Pivot around middle gray 0.18)
         contrast = preset.get('contrast', 0.0) * v_mult
@@ -491,7 +494,7 @@ class PhotoEditor:
             if saturation != 0.0:
                 sat_factor = np.maximum(np.float32(1.0 + saturation), np.float32(0.0))
                 img = grayscale + (img - grayscale) * sat_factor
-
+        
         # 9. 8-Band Color Adjustments (Luminance-Preserved HDR Chroma Mapping)
         color_adj = preset.get('color_adjustments', {})
         if color_adj and ca_mult > 0.0:
@@ -569,7 +572,7 @@ class PhotoEditor:
                     # Note: xp and yp must be monotonically increasing.
                     img[:, :, i] = np.interp(img[:, :, i], xp, yp)
 
-        # Film Simulatiaon methods
+        # Film Simulation methods
         img = apply_color_matrix(img, preset)
         img = apply_bloom(img, preset)
         img = apply_halation(img, preset)
