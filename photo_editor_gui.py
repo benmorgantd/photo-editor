@@ -1552,19 +1552,6 @@ class MainWindow(QMainWindow):
         # Channel Selectors
         g_curves = CollapsibleGroupBox("RGB Curves")
 
-        # # Combo box for common profiles
-        # profile_preset_hlayout = QHBoxLayout()
-        # profile_preset_hlayout.addWidget(QLabel('Curve Film Profile Presets: '))
-        # profiles_combobox = QComboBox()
-        # profiles_combobox.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        # profiles_combobox.addItem('None')
-        # for profile_name in FILM_PROFILES:
-        #     profiles_combobox.addItem(profile_name)
-        # profiles_combobox.currentTextChanged.connect(self._profiles_combobox_changed)
-        # profile_preset_hlayout.addWidget(profiles_combobox)
-
-        # g_curves.content_layout.addLayout(profile_preset_hlayout)
-
         channel_layout = QHBoxLayout()
         self.btn_group = QButtonGroup(self)
         
@@ -1576,7 +1563,7 @@ class MainWindow(QMainWindow):
             channel_layout.addWidget(btn)
             self.btn_group.addButton(btn)
             # Route to changing the active curves channel
-            btn.clicked.connect(lambda checked, c=code: self.curve_editor.set_channel(c))
+            btn.clicked.connect(lambda _, c=code: self.curve_editor.set_channel(c))
         
         g_curves.content_layout.addLayout(channel_layout)
         
@@ -1634,10 +1621,140 @@ class MainWindow(QMainWindow):
             g_ca.content_layout.addWidget(g_band)
         self.sliders_layout.addWidget(g_ca)
 
-        g_style = CollapsibleGroupBox("Film Grain Overlays")
+        g_style = CollapsibleGroupBox("Basic Grain")
         self.sliders_map["grain"] = self._create_slider_row(g_style.content_layout, "Grain Density Strength", 0, 100, 0, lambda v: self._update_preset_key("grain", v / 100.0))
         self.sliders_map["grain_size"] = self._create_slider_row(g_style.content_layout, "Grain Cluster Size Scale", 1, 50, 10, lambda v: self._update_preset_key("grain_size", v / 10.0))
         self.sliders_layout.addWidget(g_style)
+
+        g_film_sim = CollapsibleGroupBox('Film Simulation')
+        # ==========================================
+        # 2. Optical Bloom
+        # ==========================================
+        self.chk_bloom = QCheckBox("Enable Optical Bloom")
+        self.chk_bloom.setChecked(PhotoEditor.DEFAULT_PRESET['enable_bloom'])
+        self.chk_bloom.toggled.connect(lambda checked: self._update_preset_key('enable_bloom', checked))
+        g_film_sim.content_layout.addWidget(self.chk_bloom)
+
+        self.sliders_map['bloom_threshold'] = self._create_slider_row(
+            g_film_sim.content_layout, 'Bloom Threshold', 0, 100, 
+            int(PhotoEditor.DEFAULT_PRESET['bloom_threshold'] * 100), 
+            lambda v: self._update_preset_key('bloom_threshold', v / 100.0)
+        )
+
+        self.sliders_map['bloom_radius'] = self._create_slider_row(
+            g_film_sim.content_layout, 'Bloom Radius (px)', 1, 50, 
+            int(PhotoEditor.DEFAULT_PRESET['bloom_radius']), 
+            lambda v: self._update_preset_key('bloom_radius', float(v))
+        )
+
+        self.sliders_map['bloom_strength'] = self._create_slider_row(
+            g_film_sim.content_layout, 'Bloom Strength', 0, 100, 
+            int(PhotoEditor.DEFAULT_PRESET['bloom_strength'] * 100), 
+            lambda v: self._update_preset_key('bloom_strength', v / 100.0)
+        )
+
+
+        # ==========================================
+        # 3. Selective Halation
+        # ==========================================
+        self.chk_halation = QCheckBox("Enable Selective Halation")
+        self.chk_halation.setChecked(PhotoEditor.DEFAULT_PRESET['enable_halation'])
+        self.chk_halation.toggled.connect(lambda checked: self._update_preset_key('enable_halation', checked))
+        g_film_sim.content_layout.addWidget(self.chk_halation)
+
+        self.sliders_map['halation_threshold'] = self._create_slider_row(
+            g_film_sim.content_layout, 'Halation Threshold', 0, 100, 
+            int(PhotoEditor.DEFAULT_PRESET['halation_threshold'] * 100), 
+            lambda v: self._update_preset_key('halation_threshold', v / 100.0)
+        )
+
+        self.sliders_map['halation_radius'] = self._create_slider_row(
+            g_film_sim.content_layout, 'Halation Radius (px)', 1, 50, 
+            int(PhotoEditor.DEFAULT_PRESET['halation_radius']), 
+            lambda v: self._update_preset_key('halation_radius', float(v))
+        )
+
+        self.sliders_map['halation_strength'] = self._create_slider_row(
+            g_film_sim.content_layout, 'Halation Strength', 0, 100, 
+            int(PhotoEditor.DEFAULT_PRESET['halation_strength'] * 100), 
+            lambda v: self._update_preset_key('halation_strength', v / 100.0)
+        )
+
+        # Using -50 to 50 divided by 10.0 allows sub-pixel offsets from -5.0px to +5.0px
+        self.sliders_map['halation_offset_x'] = self._create_slider_row(
+            g_film_sim.content_layout, 'Halation Offset X', -50, 50, 
+            int(PhotoEditor.DEFAULT_PRESET['halation_offset_x'] * 10), 
+            lambda v: self._update_preset_key('halation_offset_x', v / 10.0)
+        )
+
+        self.sliders_map['halation_offset_y'] = self._create_slider_row(
+            g_film_sim.content_layout, 'Halation Offset Y', -50, 50, 
+            int(PhotoEditor.DEFAULT_PRESET['halation_offset_y'] * 10), 
+            lambda v: self._update_preset_key('halation_offset_y', v / 10.0)
+        )
+
+
+        # ==========================================
+        # 4. Smart Grain
+        # ==========================================
+        self.chk_grain = QCheckBox("Enable Smart Grain")
+        self.chk_grain.setChecked(PhotoEditor.DEFAULT_PRESET['enable_grain'])
+        self.chk_grain.toggled.connect(lambda checked: self._update_preset_key('enable_grain', checked))
+        g_film_sim.content_layout.addWidget(self.chk_grain)
+
+        self.sliders_map['grain_strength'] = self._create_slider_row(
+            g_film_sim.content_layout, 'Grain Strength', 0, 100, 
+            int(PhotoEditor.DEFAULT_PRESET['grain_strength'] * 100), 
+            lambda v: self._update_preset_key('grain_strength', v / 100.0)
+        )
+
+        # Scale 5 to 40 divided by 10.0 maps to crystal sizes from 0.5x to 4.0x
+        self.sliders_map['grain_size'] = self._create_slider_row(
+            g_film_sim.content_layout, 'Grain Roughness (Size)', 5, 40, 
+            int(PhotoEditor.DEFAULT_PRESET['grain_size'] * 10), 
+            lambda v: self._update_preset_key('grain_size', v / 10.0)
+        )
+
+        self.sliders_map['grain_chroma'] = self._create_slider_row(
+            g_film_sim.content_layout, 'Grain Color (Chroma)', 0, 100, 
+            int(PhotoEditor.DEFAULT_PRESET['grain_chroma'] * 100), 
+            lambda v: self._update_preset_key('grain_chroma', v / 100.0)
+        )
+
+
+        # ==========================================
+        # 5. Vignette & Optical Softness
+        # ==========================================
+        self.chk_vignette = QCheckBox("Enable Vignette & Softness")
+        self.chk_vignette.setChecked(PhotoEditor.DEFAULT_PRESET['enable_vignette'])
+        self.chk_vignette.toggled.connect(lambda checked: self._update_preset_key('enable_vignette', checked))
+        g_film_sim.content_layout.addWidget(self.chk_vignette)
+
+        self.sliders_map['vignette_strength'] = self._create_slider_row(
+            g_film_sim.content_layout, 'Vignette Strength', 0, 100, 
+            int(PhotoEditor.DEFAULT_PRESET['vignette_strength'] * 100), 
+            lambda v: self._update_preset_key('vignette_strength', v / 100.0)
+        )
+
+        # Radius up to 150 allows aspect-ratio corrected vignetting to reach the extreme corners (~1.414)
+        self.sliders_map['vignette_radius'] = self._create_slider_row(
+            g_film_sim.content_layout, 'Vignette Radius', 0, 150, 
+            int(PhotoEditor.DEFAULT_PRESET['vignette_radius'] * 100), 
+            lambda v: self._update_preset_key('vignette_radius', v / 100.0)
+        )
+
+        self.sliders_map['vignette_softness'] = self._create_slider_row(
+            g_film_sim.content_layout, 'Vignette Feather (Softness)', 1, 100, 
+            int(PhotoEditor.DEFAULT_PRESET['vignette_softness'] * 100), 
+            lambda v: self._update_preset_key('vignette_softness', v / 100.0)
+        )
+
+        self.sliders_map['corner_blur_radius'] = self._create_slider_row(
+            g_film_sim.content_layout, 'Corner Optical Blur (px)', 0, 30, 
+            int(PhotoEditor.DEFAULT_PRESET['corner_blur_radius']), 
+            lambda v: self._update_preset_key('corner_blur_radius', float(v)))
+
+        self.sliders_layout.addWidget(g_film_sim)
 
     def _create_slider_row(self, parent_layout, label_text: str, mn: int, mx: int, init: int, callback) -> QSlider:
         """Helper method assembling standard labeled rows containing interactive slider objects.

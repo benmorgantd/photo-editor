@@ -10,11 +10,10 @@ import json
 import os
 import sys
 from dataclasses import dataclass
-
+from scipy.interpolate import CubicSpline
 
 import logging
-from enum import Enum
-from typing import Dict, Any, List
+from typing import Dict, Any
 from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
@@ -129,7 +128,40 @@ class PhotoEditor:
                 "r" : [[0.0, 0.25, 0.50, 0.75, 1.0], [0.0, 0.25, 0.50, 0.75, 1.0]],
                 "g" : [[0.0, 0.25, 0.50, 0.75, 1.0], [0.0, 0.25, 0.50, 0.75, 1.0]],
                 "b" : [[0.0, 0.25, 0.50, 0.75, 1.0], [0.0, 0.25, 0.50, 0.75, 1.0]]
-            }
+            },
+            # 1. Tonality & Color Science
+            "color_matrix": [
+                [ 1.06, -0.04, -0.02],
+                [-0.04,  1.02,  0.02],
+                [-0.02,  0.06,  0.96]
+            ],
+            
+            # 2. Optical Bloom
+            "enable_bloom": True,
+            "bloom_threshold": 0.70,
+            "bloom_radius": 15.0,
+            "bloom_strength": 0.15, 
+            
+            # 3. Selective Halation
+            "enable_halation": True,
+            "halation_threshold": 0.60,
+            "halation_radius": 8.0,
+            "halation_strength": 0.30,
+            "halation_offset_x": 1.5,
+            "halation_offset_y": 0.0,
+            
+            # 4. Smart Grain
+            "enable_grain": True,
+            "grain_strength": 0.05, 
+            "grain_size": 1.6,      # >1.0 scales grain up for coarse emulsion
+            "grain_chroma": 0.15,   # 0.0 = B&W grain, 1.0 = color grain
+            
+            # 5. Vignette & Optical Softness
+            "enable_vignette": True,
+            "vignette_strength": 0.35,
+            "vignette_radius": 0.75,
+            "vignette_softness": 0.45,
+            "corner_blur_radius": 3.0
         }
 
     def __init__(self, image_path: str):
@@ -512,11 +544,18 @@ class PhotoEditor:
                     # Note: xp and yp must be monotonically increasing.
                     img[:, :, i] = np.interp(img[:, :, i], xp, yp)
 
+        # Film Simulatiaon methods
+        img = apply_color_matrix(img, preset)
+        img = apply_bloom(img, preset)
+        img = apply_halation(img, preset)
+        img = apply_smart_grain(img, preset)
+        img = apply_vignette_and_softness(img, preset)
+
         # 11. Optional Smoothing
-        blur_radius = preset.get('gaussian_blur', 0.0)
-        if blur_radius > 0:
-            sigma = float(blur_radius * 1.5)
-            img = cv2.GaussianBlur(img, (0, 0), sigmaX=sigma, sigmaY=sigma)
+        # blur_radius = preset.get('gaussian_blur', 0.0)
+        # if blur_radius > 0:
+        #     sigma = float(blur_radius * 1.5)
+        #     img = cv2.GaussianBlur(img, (0, 0), sigmaX=sigma, sigmaY=sigma)
 
         # 12. Display Preparation: Tonemapping at the end of float processing
         hdr_comp = preset.get('hdr_compression', 0.0)
@@ -853,8 +892,6 @@ class PhotoEditor:
             "saturation": round(auto_saturation, 2),
             "texture": -0.05,
             "clarity": -0.05,
-            "gaussian_blur": 0.01,
-            "grain": 0.05,
             "hdr_compression": 1.0,
             "color_adjustments": {
                 "green": {"hue": 0.0, "sat": round(green_sat_boost, 2)},
@@ -879,7 +916,180 @@ class PhotoEditor:
 
         cropped = self.apply_crop(self.original_image, crop_data)
         return self.run_parallel_pipeline(cropped, preset)
+
+
+def smoothstep(edge0: float, edge1: float, x: np.ndarray) -> np.ndarray:
+    """Hermite polynomial smoothstep for seamless mask thresholds."""
+    x_scaled = np.clip((x - edge0) / (edge1 - edge0), 0.0, 1.0)
+    return x_scaled * x_scaled * (3.0 - 2.0 * x_scaled)
+
+def get_luminance(image: np.ndarray) -> np.ndarray:
+    """Calculates Rec.709 relative luminance."""
+    return np.dot(image, [0.2126, 0.7152, 0.0722])
+
+def apply_lut_fast(channel: np.ndarray, points: list, lut_size: int = 4096) -> np.ndarray:
+    """
+    Generates a high-precision 1D LUT using CubicSpline and maps pixel values 
+    via direct integer indexing rather than per-pixel interpolation.
+    """
+    if not points or len(points) < 2:
+        return channel
     
+    pts = np.array(points)
+    pts = pts[np.argsort(pts[:, 0])] # Ensure monotonicity
+    
+    cs = CubicSpline(pts[:, 0], pts[:, 1], bc_type='natural')
+    x_lut = np.linspace(0.0, 1.0, lut_size)
+    y_lut = np.clip(cs(x_lut), 0.0, 1.0).astype(np.float32)
+    
+    # Map [0.0, 1.0] floats to integer indices [0, lut_size - 1]
+    indices = np.clip(channel * (lut_size - 1), 0, lut_size - 1).astype(np.int32)
+    return y_lut[indices]
+
+def apply_color_matrix(image: np.ndarray, params: dict) -> np.ndarray:
+    result = image.copy()
+    
+    # Subtractive Color Matrix (Channel Crosstalk)
+    matrix = np.array(params.get("color_matrix", np.eye(3)), dtype=np.float32)
+    if not np.array_equal(matrix, np.eye(3)):
+        # Matrix dot product across the RGB channel axis
+        result = np.dot(result, matrix.T)
+        
+    return np.clip(result, 0.0, 1.0)
+
+def apply_bloom(image: np.ndarray, params: dict) -> np.ndarray:
+    # if not params.get("enable_bloom", False) or params.get("bloom_strength", 0.0) <= 0:
+    #     return image
+        
+    threshold = params.get("bloom_threshold", 0.70)
+    radius = params.get("bloom_radius", 15.0)
+    strength = params.get("bloom_strength", 0.15)
+    
+    # 1. Generate smooth luminance mask
+    lum = get_luminance(image)
+    mask = smoothstep(threshold, np.clip(threshold + 0.25, 0.0, 1.0), lum)
+    
+    # 2. Extract highlights and apply Gaussian diffusion
+    highlights = image * mask[..., np.newaxis]
+    
+    # Ensure kernel size is odd and positive
+    k_size = int(radius * 2) | 1
+    blurred_highlights = cv2.GaussianBlur(highlights, (k_size, k_size), sigmaX=radius, sigmaY=radius)
+    
+    # 3. Screen blend composite
+    bloom_layer = blurred_highlights * strength
+    screen_blend = 1.0 - (1.0 - image) * (1.0 - bloom_layer)
+    
+    return np.clip(screen_blend, 0.0, 1.0)
+
+def apply_halation(image: np.ndarray, params: dict) -> np.ndarray:
+    if not params.get("enable_halation", False) or params.get("halation_strength", 0.0) <= 0:
+        return image
+        
+    threshold = params.get("halation_threshold", 0.60)
+    radius = params.get("halation_radius", 8.0)
+    strength = params.get("halation_strength", 0.30)
+    offset_x = params.get("halation_offset_x", 0.0)
+    offset_y = params.get("halation_offset_y", 0.0)
+    
+    # 1. Calculate Red Dominance + Luminance mask
+    lum = get_luminance(image)
+    red_dom = np.clip((image[..., 0] * 2.0 - image[..., 1] - image[..., 2]), 0.0, 1.0)
+    
+    # Halation occurs where light is bright AND warm/neutral
+    halation_mask = smoothstep(threshold, 1.0, lum) * smoothstep(0.1, 0.5, red_dom + lum)
+    
+    # 2. Isolate red channel highlights and blur
+    red_highlights = image[..., 0] * halation_mask
+    k_size = int(radius * 2) | 1
+    blurred_red = cv2.GaussianBlur(red_highlights, (k_size, k_size), sigmaX=radius, sigmaY=radius)
+    
+    # 3. Apply spatial affine translation (emulsion scatter / chromatic shift)
+    if offset_x != 0.0 or offset_y != 0.0:
+        rows, cols = image.shape[:2]
+        M = np.float32([[1, 0, offset_x], [0, 1, offset_y]])
+        blurred_red = cv2.warpAffine(blurred_red, M, (cols, rows), borderMode=cv2.BORDER_REPLICATE)
+        
+    # 4. Composite exclusively onto the Red channel via Screen blend
+    result = image.copy()
+    red_glow = blurred_red * strength
+    result[..., 0] = 1.0 - (1.0 - result[..., 0]) * (1.0 - red_glow)
+    
+    return np.clip(result, 0.0, 1.0)
+
+def apply_smart_grain(image: np.ndarray, params: dict) -> np.ndarray:
+    if not params.get("enable_grain", False) or params.get("grain_strength", 0.0) <= 0:
+        return image
+        
+    strength = params.get("grain_strength", 0.05)
+    size = max(0.5, params.get("grain_size", 1.0))
+    chroma_weight = np.clip(params.get("grain_chroma", 0.1), 0.0, 1.0)
+    
+    h, w = image.shape[:2]
+    
+    # 1. Calculate dimensions for grain crystal scaling
+    gh, gw = int(h / size), int(w / size)
+    
+    # 2. Generate luma and chroma noise textures
+    luma_noise = np.random.normal(0.0, 1.0, (gh, gw)).astype(np.float32)
+    
+    if chroma_weight > 0:
+        chroma_noise = np.random.normal(0.0, 1.0, (gh, gw, 3)).astype(np.float32)
+        # Combine mono and color noise based on chroma weight
+        noise = (chroma_noise * chroma_weight) + (luma_noise[..., np.newaxis] * (1.0 - chroma_weight))
+    else:
+        noise = luma_noise[..., np.newaxis]
+        
+    # 3. Scale noise up to image resolution using bicubic interpolation for organic softness
+    if size != 1.0:
+        noise = cv2.resize(noise, (w, h), interpolation=cv2.INTER_CUBIC)
+        if noise.ndim == 2:
+            noise = noise[..., np.newaxis]
+            
+    # 4. Parabolic luminance mask: peak grain at 50% gray (0.5), zero at 0.0 and 1.0
+    lum = get_luminance(image)[..., np.newaxis]
+    luma_mask = 4.0 * lum * (1.0 - lum)
+    
+    # 5. Apply grain via linear addition modulated by the luma mask
+    grain_layer = noise * strength * luma_mask
+    return np.clip(image + grain_layer, 0.0, 1.0)
+
+def apply_vignette_and_softness(image: np.ndarray, params: dict) -> np.ndarray:
+    if not params.get("enable_vignette", False) or params.get("vignette_strength", 0.0) <= 0:
+        return image
+        
+    strength = np.clip(params.get("vignette_strength", 0.3), 0.0, 1.0)
+    radius = params.get("vignette_radius", 0.75)
+    softness = max(0.01, params.get("vignette_softness", 0.45))
+    blur_radius = params.get("corner_blur_radius", 0.0)
+    
+    h, w = image.shape[:2]
+    
+    # 1. Generate aspect-ratio corrected radial distance grid [0.0 to ~1.4]
+    y, x = np.ogrid[-1.0:1.0:h*1j, -1.0:1.0:w*1j]
+    aspect = w / float(h)
+    x_corrected = x * aspect
+    r = np.sqrt(x_corrected**2 + y**2) / np.sqrt(aspect**2 + 1.0)
+    
+    # 2. Compute smooth vignette falloff mask
+    inner = max(0.0, radius - softness)
+    outer = radius + softness
+    vignette_mask = 1.0 - (smoothstep(inner, outer, r) * strength)
+    vignette_mask = vignette_mask[..., np.newaxis]
+    
+    result = image.copy()
+    
+    # 3. Apply corner optical softness (vintage wide-angle lens emulation)
+    if blur_radius > 0:
+        k_size = int(blur_radius * 2) | 1
+        blurred_img = cv2.GaussianBlur(image, (k_size, k_size), sigmaX=blur_radius)
+        
+        # Blur mask increases toward the corners
+        blur_mask = smoothstep(radius * 0.5, outer, r)[..., np.newaxis]
+        result = (result * (1.0 - blur_mask)) + (blurred_img * blur_mask)
+        
+    # 4. Apply exposure falloff
+    return np.clip(result * vignette_mask, 0.0, 1.0)
 
 def export_photo(img_array: np.ndarray, output_path: str, preset: Dict[str, Any], max_mb: float = 8.0):
     """Applies film noise grain overlays and frames pre-cropped, processed image matrices.
@@ -895,16 +1105,16 @@ def export_photo(img_array: np.ndarray, output_path: str, preset: Dict[str, Any]
     active_crop_variant = preset.get('active_crop_variant', 'default')
     crop_variant_data = preset['crop_variants'][active_crop_variant]
     
-    grain = preset.get('grain', 0.0)
-    grain_size = preset.get('grain_size', 1.0)
-    if grain > 0.0:
-        fh, fw, fc = final_img_array.shape
-        g_size = max(0.1, grain_size)
-        noise_h, noise_w = max(1, int(fh / g_size)), max(1, int(fw / g_size))
-        noise = np.random.normal(0, grain * 12.7, (noise_h, noise_w, fc)).astype(np.float32)
-        if g_size != 1.0:
-            noise = cv2.resize(noise, (fw, fh), interpolation=cv2.INTER_LINEAR)
-        final_img_array = np.clip(final_img_array.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+    # grain = preset.get('grain', 0.0)
+    # grain_size = preset.get('grain_size', 1.0)
+    # if grain > 0.0:
+    #     fh, fw, fc = final_img_array.shape
+    #     g_size = max(0.1, grain_size)
+    #     noise_h, noise_w = max(1, int(fh / g_size)), max(1, int(fw / g_size))
+    #     noise = np.random.normal(0, grain * 12.7, (noise_h, noise_w, fc)).astype(np.float32)
+    #     if g_size != 1.0:
+    #         noise = cv2.resize(noise, (fw, fh), interpolation=cv2.INTER_LINEAR)
+    #     final_img_array = np.clip(final_img_array.astype(np.float32) + noise, 0, 255).astype(np.uint8)
 
     if crop_variant_data.get('add_white_border', False):
         final_img_array = PhotoEditor.apply_white_border(final_img_array, preset)
