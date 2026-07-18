@@ -5,6 +5,7 @@ geometric transformations, and dynamic range tonemapping using multi-threaded
 stripe segmentation algorithms.
 """
 
+import hashlib
 import argparse
 import json
 import os
@@ -110,6 +111,71 @@ FILM_PROFILES = {
 }
 
 
+class PipelineStage:
+    def __init__(self, name, param_keys):
+        self.name = name
+        self.param_keys = param_keys  # Which keys in 'preset' trigger this stage
+        self.last_params = None
+        self.data = None
+
+    def is_dirty(self, preset):
+        # Extract only the keys this stage cares about
+        current_params = {k: preset.get(k) for k in self.param_keys}
+        # Create a hash of these params
+        param_hash = hash(frozenset(current_params.items()))
+        
+        if param_hash != self.last_params:
+            self.last_params = param_hash
+            return True
+        return False
+
+    def run(self):
+        raise NotImplementedError()
+    
+class WBStage(PipelineStage):
+    def __init__(self):
+        super().__init__('wb', ['temp_kelvin', 'tint', 'apply_temperature_adjustment'])
+    
+    def run(self, img, preset):
+        temp_kelvin = preset['temp_kelvin']
+        tint = preset['tint']
+
+        if temp_kelvin > 6500.0:
+            temp_factor = min(temp_kelvin - 6500.0, 5500.0) / 5500.0
+            img[:, :, 0] *= np.float32(1.0 + temp_factor * 0.25)
+            img[:, :, 2] *= np.float32(1.0 - temp_factor * 0.20)
+        else:
+            temp_factor = max(6500.0 - temp_kelvin, 4500.0) / 4500.0
+            img[:, :, 2] *= np.float32(1.0 + temp_factor * 0.30)
+            img[:, :, 0] *= np.float32(1.0 - temp_factor * 0.15)
+
+        if tint != 0.0:
+            img[:, :, 1] *= np.float32(1.0 + tint * 0.15)
+        
+        return img.copy()
+
+class PipelineState:
+    def __init__(self):
+        self.stages = {
+            'wb': WBStage(),
+            # 'exposure': PipelineStage('exposure', ['exposure']),
+            # 'contrast': PipelineStage('contrast', ['contrast', 'values_multiplier']),
+            # 'curves': CurvesStage(),
+            # 'bloom': PipelineStage('bloom', ['bloom', 'bloom_radius'])
+        }
+        self.order = ['wb', 'exposure', 'contrast', 'curves', 'bloom']
+
+    def process(self, stage_name, preset, input_data, compute_func):
+        stage = self.stages[stage_name]
+        
+        # Self-Check: Is this stage dirty?
+        if stage.is_dirty(preset) or stage.data is None:
+            # If dirty, recompute and store
+            stage.data = compute_func(input_data, preset).copy()
+        
+        return stage.data
+
+
 class PhotoEditor:
     """Handles core image processing operations for photo editing filters.
 
@@ -194,10 +260,13 @@ class PhotoEditor:
 
         Args:
             image_path (str): The path to the image asset file.
+            image_matrix
         """
         self.image_path = image_path
         logger.info(f"Initializing PhotoEditor instance matrix for: {os.path.basename(image_path)}")
-        self.original_image = self.load_image_matrix(image_path)
+        # self.original_image = self.load_image_matrix(image_path)
+        # TODO: an instance of PhotoEditor could cache a lot of information, like the image matrix and cached steps
+        self.pipeline_state = PipelineState()
 
     @staticmethod
     def load_image_matrix(image_path: str, preview: bool = False, max_width: int = 1200) -> np.ndarray:
@@ -357,14 +426,30 @@ class PhotoEditor:
             0.0
         ).astype(np.float32)
 
+    @staticmethod
+    def _apply_white_balance_adjustments(img : np.ndarray, temp_kelvin : float, tint : float) -> np.ndarray:
+        if temp_kelvin > 6500.0:
+            temp_factor = min(temp_kelvin - 6500.0, 5500.0) / 5500.0
+            img[:, :, 0] *= np.float32(1.0 + temp_factor * 0.25)
+            img[:, :, 2] *= np.float32(1.0 - temp_factor * 0.20)
+        else:
+            temp_factor = max(6500.0 - temp_kelvin, 4500.0) / 4500.0
+            img[:, :, 2] *= np.float32(1.0 + temp_factor * 0.30)
+            img[:, :, 0] *= np.float32(1.0 - temp_factor * 0.15)
+
+        if tint != 0.0:
+            img[:, :, 1] *= np.float32(1.0 + tint * 0.15)
+        
+        return img.copy()
+
     # TODO: this is getting heavier and heavier as we continue to add steps. We need to do lazy caching here.
-    @classmethod
-    def run_pipeline(cls, src_matrix: np.ndarray, preset: Dict[str, Any]) -> np.ndarray:
+    def run_pipeline(self, src_matrix: np.ndarray, preset: Dict[str, Any], fast_preview : bool=False) -> np.ndarray:
         """Executes core image filters sequentially using in-place operations.
 
         Args:
             src_matrix (np.ndarray): The source image chunk to apply filter logic upon.
             preset (Dict[str, Any]): Dictionary containing configuration presets.
+            fast_preview (bool)    : Run optimizations for faster processing
 
         Returns:
             np.ndarray: Fully processed floating-point RGB matrix layout.
@@ -380,27 +465,15 @@ class PhotoEditor:
         # 1. White Balance (Temperature & Tint via Multiplicative Gain)
         apply_temp = preset.get('apply_temperature_adjustment', True)
         temp_kelvin = preset.get('temp_kelvin', 6500.0)
-        tint = preset.get('tint', 0.0)  
-        
-        if apply_temp and temp_kelvin != 6500.0:
-            if temp_kelvin > 6500.0:
-                temp_factor = min(temp_kelvin - 6500.0, 5500.0) / 5500.0
-                img[:, :, 0] *= np.float32(1.0 + temp_factor * 0.25)
-                img[:, :, 2] *= np.float32(1.0 - temp_factor * 0.20)
-            else:
-                temp_factor = max(6500.0 - temp_kelvin, 4500.0) / 4500.0
-                img[:, :, 2] *= np.float32(1.0 + temp_factor * 0.30)
-                img[:, :, 0] *= np.float32(1.0 - temp_factor * 0.15)
+        tint = preset.get('tint', 0.0)
 
-        if tint != 0.0:
-            img[:, :, 1] *= np.float32(1.0 + tint * 0.15)
+        # TODO: only execute if step is dirty
+        img = self._apply_white_balance_adjustments(img, temp_kelvin, tint)
 
         # 2. Exposure (1 EV = 2x multiplier)
         exposure = preset.get('exposure', 0.0)
         if exposure != 0.0:
             img *= np.float32(2.0 ** exposure)
-
-        return img
 
         # 3. Contrast (Pivot around middle gray 0.18)
         contrast = preset.get('contrast', 0.0) * v_mult
@@ -458,6 +531,7 @@ class PhotoEditor:
 
             img *= np.expand_dims(new_lum / lum_safe, axis=2)
         
+        return img
         # 6. Texture (High-Frequency Local Detail - Dynamic Kernel Scaling)
         texture = preset.get('texture', 0.0)
         if texture != 0.0:
@@ -594,23 +668,26 @@ class PhotoEditor:
         np.clip(img, 0.0, 1.0, out=img)
         return img
 
-    @classmethod
-    def run_parallel_pipeline(cls, src_matrix: np.ndarray, preset: Dict[str, Any]) -> np.ndarray:
+    def run_parallel_pipeline(self, src_matrix: np.ndarray, preset: Dict[str, Any], fast_preview : bool = False) -> np.ndarray:
         """Scales pre-cropped image matrices to match compression dimensions, then processes tiles concurrently.
 
         Args:
             src_matrix (np.ndarray): Bounded pre-cropped image matrix array layer.
             preset (Dict[str, Any]): Dictionary containing configuration presets.
+            fast_preview (bool)    : Optimizes the calculation for faster previewing when scrubbing.
 
         Returns:
             np.ndarray: Multi-core rendered full raster color grid matrix output.
         """
+
+        # TODO: we need to do stage validation here to determine what to process.
+
         h, w, c = src_matrix.shape
         active_crop_variant = preset.get('active_crop_variant', 'default')
         crop_variant_data = preset['crop_variants'][active_crop_variant]
         do_instagram_compression = crop_variant_data.get('do_instagram_compression', True)
-
-        if do_instagram_compression:
+        
+        if do_instagram_compression or fast_preview:
             target_w = 1080
             if w != target_w:
                 aspect_ratio = h / w
@@ -622,7 +699,7 @@ class PhotoEditor:
         
         h, w, c = src_matrix.shape
         if h < 32 or w < 32:
-            return cls.run_pipeline(src_matrix, preset)
+            return self.run_pipeline(src_matrix, preset, fast_preview=fast_preview)
 
         output_matrix = np.empty_like(src_matrix)
         cores = os.cpu_count() or 4
@@ -637,7 +714,7 @@ class PhotoEditor:
             pad_end = min(h, y_end + margin)
 
             stripe_input = src_matrix[pad_start:pad_end, :, :]
-            processed_stripe = cls.run_pipeline(stripe_input, preset)
+            processed_stripe = self.run_pipeline(stripe_input, preset, fast_preview=fast_preview)
 
             offset = y_start - pad_start
             slice_length = y_end - y_start
@@ -929,21 +1006,21 @@ class PhotoEditor:
             }
         }
 
-    def apply_presets(self, preset: Dict[str, Any]) -> np.ndarray:
-        """Unified instance abstraction method executing the full pipeline pass.
+    # def apply_presets(self, preset: Dict[str, Any]) -> np.ndarray:
+    #     """Unified instance abstraction method executing the full pipeline pass.
 
-        Args:
-            preset (Dict[str, Any]): Target metrics properties layout map.
+    #     Args:
+    #         preset (Dict[str, Any]): Target metrics properties layout map.
 
-        Returns:
-            np.ndarray: Rendered image matrix.
-        """
+    #     Returns:
+    #         np.ndarray: Rendered image matrix.
+    #     """
 
-        active_crop_variant = preset.get("active_crop_variant", "default")
-        crop_data = preset["crop_variants"][active_crop_variant]
+    #     active_crop_variant = preset.get("active_crop_variant", "default")
+    #     crop_data = preset["crop_variants"][active_crop_variant]
 
-        cropped = self.apply_crop(self.original_image, crop_data)
-        return self.run_parallel_pipeline(cropped, preset)
+    #     cropped = self.apply_crop(self.original_image, crop_data)
+    #     return self.run_parallel_pipeline(cropped, preset)
 
 
 def smoothstep(edge0: float, edge1: float, x: np.ndarray) -> np.ndarray:

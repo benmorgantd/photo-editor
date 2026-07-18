@@ -117,6 +117,7 @@ class ExportWorker(QThread):
                 logger.info(f"Starting batch task segment processing pass ({idx+1}/{total_files}): {base_name}")
                 self.progress_signal.emit(f"[{idx+1}/{total_files}] Loading high-fidelity asset matrix for: {base_name}...")
                 
+                # TODO: start an instance of PhotoEditor
                 full_res = PhotoEditor.load_image_matrix(img_path, preview=False)
 
                 # Check again before the next heavy operation
@@ -130,7 +131,8 @@ class ExportWorker(QThread):
                     break
 
                 self.progress_signal.emit(f"[{idx+1}/{total_files}] Computing multi-core tile pixel transformations...")
-                processed_full = PhotoEditor.run_parallel_pipeline(cropped_full, item_preset)
+                photo_editor = PhotoEditor(img_path)
+                processed_full = photo_editor.run_parallel_pipeline(cropped_full, item_preset)
 
                 if self._is_cancelled:
                     break
@@ -444,28 +446,30 @@ class ZoomableGraphicsView(QGraphicsView):
     
     def zoom_to_fit(self):
         scene = self.scene()
-        if not scene:
+        if not scene or scene.itemsBoundingRect().isNull():
             return
 
-        # Use the actual bounding box of the contents, not the scene's container
-        content_rect = scene.itemsBoundingRect()
-        if content_rect.isNull():
-            return
-
-        # 1. Temporarily disable anchors
-        anchor = self.transformationAnchor()
-        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
-
-        # 2. Reset the transformation matrix to identity so fitInView 
-        #    calculates from a "clean" scale of 1.0
+        # 1. Disable auto-alignment so it doesn't fight our manual scroll calculation
+        self.setAlignment(Qt.AlignmentFlag(0)) 
+        
+        # 2. Reset transform to get a clean baseline
         self.resetTransform()
-
-        # 3. Fit the view to the items, not the scene container
-        #    Add a small margin (e.g., 0.95) if you don't want it touching edges
-        self.fitInView(content_rect, Qt.AspectRatioMode.KeepAspectRatio)
-
-        # 4. Restore original anchor
-        self.setTransformationAnchor(anchor)
+        
+        # 3. Calculate the scale factor
+        target_rect = scene.itemsBoundingRect()
+        view_rect = self.viewport().rect()
+        
+        scale_factor = min(
+            view_rect.width() / target_rect.width(),
+            view_rect.height() / target_rect.height()
+        ) * 0.95
+        
+        # 4. Apply scale
+        self.scale(scale_factor, scale_factor)
+        
+        # 5. Force center using the scene center point
+        # centerOn() works best when the view doesn't have an Alignment set
+        self.centerOn(target_rect.center())
 
 # ---------------------------------------------------------
 # Native 1D Natural Cubic Spline Interpolation Solver
@@ -854,6 +858,8 @@ class MainWindow(QMainWindow):
         self.resize(1600, 950)
 
         self.default_curve_vals = [0.0, 0.25, 0.5, 0.75, 1.0]
+
+        self.photo_editor_instance = None
 
         self.thread_pool = QThreadPool.globalInstance()
 
@@ -1585,6 +1591,32 @@ class MainWindow(QMainWindow):
         self.sliders_map["white_border_width_pct"] = self._create_slider_row(g_crop.content_layout, "Border Frame Width (%)", 1, 20, 5, lambda v: self._update_preset_key("white_border_width_pct", v))
         self.sliders_layout.addWidget(g_crop)
 
+        g_wb = CollapsibleGroupBox("White Balance Properties")
+        self.cb_apply_temp = QCheckBox("Apply Kelvin Temperature Vector Transformation")
+        self.cb_apply_temp.setChecked(True)
+        self.cb_apply_temp.toggled.connect(lambda state: self._update_preset_key("apply_temperature_adjustment", state))
+        g_wb.content_layout.addWidget(self.cb_apply_temp)
+        self.sliders_map["temp_kelvin"] = self._create_slider_row(g_wb.content_layout, "Temperature (Kelvin)", 2000, 12000, 6500, lambda v: self._update_preset_key("temp_kelvin", v))
+        self.sliders_map["tint"] = self._create_slider_row(g_wb.content_layout, "Tint", -100, 100, 0, lambda v: self._update_preset_key("tint", v / 100.0))
+        self.sliders_layout.addWidget(g_wb)
+
+        g_val = CollapsibleGroupBox("Global Exposure & Values")
+        self.sliders_map["values_multiplier"] = self._create_slider_row(g_val.content_layout, "Values Shift Multiplier", 0, 100, 100, lambda v: self._update_preset_key("values_multiplier", v / 100.0))
+        self.sliders_map["exposure"] = self._create_slider_row(g_val.content_layout, "Exposure (Stops)", -200, 200, 0, lambda v: self._update_preset_key("exposure", v / 100.0))
+        self.sliders_map["contrast"] = self._create_slider_row(g_val.content_layout, "Contrast", -100, 100, 0, lambda v: self._update_preset_key("contrast", v / 100.0))
+        self.sliders_map["whites"] = self._create_slider_row(g_val.content_layout, "Whites", -100, 100, 0, lambda v: self._update_preset_key("whites", v / 100.0))
+        self.sliders_map["blacks"] = self._create_slider_row(g_val.content_layout, "Blacks", -100, 100, 0, lambda v: self._update_preset_key("blacks", v / 100.0))
+        self.sliders_map["highlights"] = self._create_slider_row(g_val.content_layout, "Highlights Recovery", -100, 100, 0, lambda v: self._update_preset_key("highlights", v / 100.0))
+        self.sliders_map["shadows"] = self._create_slider_row(g_val.content_layout, "Shadows Optimization", -100, 100, 0, lambda v: self._update_preset_key("shadows", v / 100.0))
+        self.sliders_map["hdr_compression"] = self._create_slider_row(g_val.content_layout, "HDR Compression Curve", 0, 100, 0, lambda v: self._update_preset_key("hdr_compression", v / 100.0))
+        self.sliders_layout.addWidget(g_val)
+
+        g_col = CollapsibleGroupBox("Global Color Engine")
+        self.sliders_map["color_multiplier"] = self._create_slider_row(g_col.content_layout, "Global Color Multiplier", 0, 100, 100, lambda v: self._update_preset_key("color_multiplier", v / 100.0))
+        self.sliders_map["vibrance"] = self._create_slider_row(g_col.content_layout, "Vibrance (Muted Weight)", -100, 100, 0, lambda v: self._update_preset_key("vibrance", v / 100.0))
+        self.sliders_map["saturation"] = self._create_slider_row(g_col.content_layout, "Saturation (Linear Multiplier)", -100, 100, 0, lambda v: self._update_preset_key("saturation", v / 100.0))
+        self.sliders_layout.addWidget(g_col)
+
         # Channel Selectors
         g_curves = CollapsibleGroupBox("RGB Curves")
 
@@ -1613,38 +1645,6 @@ class MainWindow(QMainWindow):
 
         self.sliders_layout.addWidget(g_curves)
 
-        g_val = CollapsibleGroupBox("Global Exposure & Values")
-        self.sliders_map["values_multiplier"] = self._create_slider_row(g_val.content_layout, "Values Shift Multiplier", 0, 100, 100, lambda v: self._update_preset_key("values_multiplier", v / 100.0))
-        self.sliders_map["exposure"] = self._create_slider_row(g_val.content_layout, "Exposure (Stops)", -200, 200, 0, lambda v: self._update_preset_key("exposure", v / 100.0))
-        self.sliders_map["contrast"] = self._create_slider_row(g_val.content_layout, "Contrast", -100, 100, 0, lambda v: self._update_preset_key("contrast", v / 100.0))
-        self.sliders_map["whites"] = self._create_slider_row(g_val.content_layout, "Whites", -100, 100, 0, lambda v: self._update_preset_key("whites", v / 100.0))
-        self.sliders_map["blacks"] = self._create_slider_row(g_val.content_layout, "Blacks", -100, 100, 0, lambda v: self._update_preset_key("blacks", v / 100.0))
-        self.sliders_map["highlights"] = self._create_slider_row(g_val.content_layout, "Highlights Recovery", -100, 100, 0, lambda v: self._update_preset_key("highlights", v / 100.0))
-        self.sliders_map["shadows"] = self._create_slider_row(g_val.content_layout, "Shadows Optimization", -100, 100, 0, lambda v: self._update_preset_key("shadows", v / 100.0))
-        self.sliders_map["hdr_compression"] = self._create_slider_row(g_val.content_layout, "HDR Compression Curve", 0, 100, 0, lambda v: self._update_preset_key("hdr_compression", v / 100.0))
-        self.sliders_layout.addWidget(g_val)
-
-        g_col = CollapsibleGroupBox("Global Color Engine")
-        self.sliders_map["color_multiplier"] = self._create_slider_row(g_col.content_layout, "Global Color Multiplier", 0, 100, 100, lambda v: self._update_preset_key("color_multiplier", v / 100.0))
-        self.sliders_map["vibrance"] = self._create_slider_row(g_col.content_layout, "Vibrance (Muted Weight)", -100, 100, 0, lambda v: self._update_preset_key("vibrance", v / 100.0))
-        self.sliders_map["saturation"] = self._create_slider_row(g_col.content_layout, "Saturation (Linear Multiplier)", -100, 100, 0, lambda v: self._update_preset_key("saturation", v / 100.0))
-        self.sliders_layout.addWidget(g_col)
-
-        g_wb = CollapsibleGroupBox("White Balance Properties")
-        self.cb_apply_temp = QCheckBox("Apply Kelvin Temperature Vector Transformation")
-        self.cb_apply_temp.setChecked(True)
-        self.cb_apply_temp.toggled.connect(lambda state: self._update_preset_key("apply_temperature_adjustment", state))
-        g_wb.content_layout.addWidget(self.cb_apply_temp)
-        self.sliders_map["temp_kelvin"] = self._create_slider_row(g_wb.content_layout, "Temperature (Kelvin)", 2000, 12000, 6500, lambda v: self._update_preset_key("temp_kelvin", v))
-        self.sliders_map["tint"] = self._create_slider_row(g_wb.content_layout, "Tint", -100, 100, 0, lambda v: self._update_preset_key("tint", v / 100.0))
-        self.sliders_layout.addWidget(g_wb)
-
-        g_freq = CollapsibleGroupBox("Local Frequency Adjustments")
-        self.sliders_map["texture"] = self._create_slider_row(g_freq.content_layout, "Texture Definition", -100, 100, 0, lambda v: self._update_preset_key("texture", v / 100.0))
-        self.sliders_map["clarity"] = self._create_slider_row(g_freq.content_layout, "Clarity Profile", -100, 100, 0, lambda v: self._update_preset_key("clarity", v / 100.0))
-        self.sliders_map["gaussian_blur"] = self._create_slider_row(g_freq.content_layout, "Gaussian Spatial Blur Pass", 0, 50, 0, lambda v: self._update_preset_key("gaussian_blur", v / 10.0))
-        self.sliders_layout.addWidget(g_freq)
-
         g_ca = CollapsibleGroupBox("Targeted Chromatic Bands")
         self.sliders_map["color_adjustments_multiplier"] = self._create_slider_row(g_ca.content_layout, "Target Bands Multiplier", 0, 100, 100, lambda v: self._update_preset_key("color_adjustments_multiplier", v / 100.0))
         
@@ -1656,6 +1656,13 @@ class MainWindow(QMainWindow):
             self.sliders_map[f"{band}_sat"] = self._create_slider_row(vbox_b, "Saturation Intensity", -100, 100, 0, lambda val, b=band: self._update_nested_color_preset(b, "sat", val / 100.0))
             g_ca.content_layout.addWidget(g_band)
         self.sliders_layout.addWidget(g_ca)
+
+
+        g_freq = CollapsibleGroupBox("Local Frequency Adjustments")
+        self.sliders_map["texture"] = self._create_slider_row(g_freq.content_layout, "Texture Definition", -100, 100, 0, lambda v: self._update_preset_key("texture", v / 100.0))
+        self.sliders_map["clarity"] = self._create_slider_row(g_freq.content_layout, "Clarity Profile", -100, 100, 0, lambda v: self._update_preset_key("clarity", v / 100.0))
+        self.sliders_map["gaussian_blur"] = self._create_slider_row(g_freq.content_layout, "Gaussian Spatial Blur Pass", 0, 50, 0, lambda v: self._update_preset_key("gaussian_blur", v / 10.0))
+        self.sliders_layout.addWidget(g_freq)
 
         g_style = CollapsibleGroupBox("Basic Grain")
         self.sliders_map["grain"] = self._create_slider_row(g_style.content_layout, "Grain Density Strength", 0, 100, 0, lambda v: self._update_preset_key("grain", v / 100.0))
@@ -2187,6 +2194,9 @@ class MainWindow(QMainWindow):
         logger.info(f"Target file workspace selected node swap focus: {path}")
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
 
+        # init a new instance of PhotoEditor so we can cache edits
+        self.photo_editor_instance = PhotoEditor(self.current_file_path)
+
         try:
             if self.is_in_browse_mode:
                 logger.info("Exiting early because we are in browse mode")
@@ -2235,10 +2245,8 @@ class MainWindow(QMainWindow):
             # 4. Dispatch the background task for the full-resolution matrix
             stored_preview_matrix = self.image_matrix_cache.get(self.current_file_path, dict()).get('preview_matrix')
             if stored_preview_matrix is not None:
-                print('using preview matrix')
                 self.preview_matrix = stored_preview_matrix.copy()
             else:
-                print('starting preview matrix background load')
                 self._start_background_fullres_load(path)
 
             # TODO: start a thread loading the proxy matrices for the surrounding 10 files in the tree
@@ -2306,7 +2314,7 @@ class MainWindow(QMainWindow):
         else:
             # TODO: we could probably cache the cropped preview if crop data hasn't changed.
             cropped_preview = PhotoEditor.apply_crop(source_matrix, self.active_crop_data)  # This takes no time
-            render_array = PhotoEditor.run_parallel_pipeline(cropped_preview, self.preset)  # This takes 4 seconds
+            render_array = self.photo_editor_instance.run_parallel_pipeline(cropped_preview, self.preset, fast_preview=self.is_scrubbing)  # This takes 4 seconds
 
         # Trigger histogram asynchronously or on downsampled data to prevent UI blocks
         self.histogram_widget.render_histogram(render_array)
