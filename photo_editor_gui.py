@@ -36,7 +36,7 @@ from PyQt6.QtWidgets import (
     QFrame, QLineEdit, QMenu, QProgressDialog, QMessageBox, QGraphicsPixmapItem, QRadioButton, QButtonGroup, QDoubleSpinBox, QSizePolicy
 )
 
-from photo_editor_core import PhotoEditor, export_photo, SUPPORTED_EXTENSIONS, RAW_EXTENSIONS, FILM_PROFILES
+from photo_editor_core import PhotoEditor, export_photo, SUPPORTED_EXTENSIONS, RAW_EXTENSIONS, FILM_PROFILES, PipelineState
 
 # Setup persistent file logging locations locally inside specific subfolder structures
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) or os.getcwd()
@@ -132,7 +132,7 @@ class ExportWorker(QThread):
 
                 self.progress_signal.emit(f"[{idx+1}/{total_files}] Computing multi-core tile pixel transformations...")
                 photo_editor = PhotoEditor(img_path)
-                processed_full = photo_editor.run_parallel_pipeline(cropped_full, item_preset)
+                processed_full = photo_editor.run_parallel_pipeline(cropped_full, item_preset, None)
 
                 if self._is_cancelled:
                     break
@@ -857,6 +857,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Free Python Desktop Photo Editor by Ben Morgan")
         self.resize(1600, 950)
 
+        self.pipeline_state = PipelineState()
+        self.crop_data_cache = {'cropped_matrix' : None, 'crop_data' : None}
+
         self.default_curve_vals = [0.0, 0.25, 0.5, 0.75, 1.0]
 
         self.photo_editor_instance = None
@@ -967,7 +970,6 @@ class MainWindow(QMainWindow):
         manifest_file_path = self._get_preset_manifest_filepath_for_image(file_path)
 
         # Just overwrite the file
-        
         try:
             with open(manifest_file_path, "w", encoding="utf-8") as f:
                 json.dump(preset_data, f, indent=2, ensure_ascii=False)
@@ -1484,6 +1486,8 @@ class MainWindow(QMainWindow):
         ext = os.path.splitext(path)[1].lower()
         if ext not in SUPPORTED_EXTENSIONS:
             return
+        
+        self.crop_data_cache = dict()
             
         self.preview_target_path = path
         self.preview_render_timer.start(80)
@@ -2313,8 +2317,15 @@ class MainWindow(QMainWindow):
             render_array = source_matrix
         else:
             # TODO: we could probably cache the cropped preview if crop data hasn't changed.
-            cropped_preview = PhotoEditor.apply_crop(source_matrix, self.active_crop_data)  # This takes no time
-            render_array = self.photo_editor_instance.run_parallel_pipeline(cropped_preview, self.preset, fast_preview=self.is_scrubbing)  # This takes 4 seconds
+            # TODO: we need to invalidate active crop data when we switch images
+            if self.active_crop_data == self.crop_data_cache.get('crop_data'):
+                cropped_preview = self.crop_data_cache['cropped_matrix']
+            else:
+                cropped_preview = PhotoEditor.apply_crop(source_matrix, self.active_crop_data)
+                self.crop_data_cache['crop_data'] = self.active_crop_data.copy()
+                self.crop_data_cache['cropped_matrix'] = cropped_preview.copy()
+
+            render_array = self.photo_editor_instance.run_parallel_pipeline(cropped_preview, self.preset, self.pipeline_state, fast_preview=self.is_scrubbing)  # This takes 4 seconds
 
         # Trigger histogram asynchronously or on downsampled data to prevent UI blocks
         self.histogram_widget.render_histogram(render_array)

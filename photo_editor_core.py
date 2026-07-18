@@ -129,7 +129,7 @@ class PipelineStage:
             return True
         return False
 
-    def run(self):
+    def run(self, img, preset):
         raise NotImplementedError()
     
 class WBStage(PipelineStage):
@@ -137,42 +137,117 @@ class WBStage(PipelineStage):
         super().__init__('wb', ['temp_kelvin', 'tint', 'apply_temperature_adjustment'])
     
     def run(self, img, preset):
+        out = img.copy()
         temp_kelvin = preset['temp_kelvin']
         tint = preset['tint']
 
         if temp_kelvin > 6500.0:
             temp_factor = min(temp_kelvin - 6500.0, 5500.0) / 5500.0
-            img[:, :, 0] *= np.float32(1.0 + temp_factor * 0.25)
-            img[:, :, 2] *= np.float32(1.0 - temp_factor * 0.20)
+            out[:, :, 0] *= np.float32(1.0 + temp_factor * 0.25)
+            out[:, :, 2] *= np.float32(1.0 - temp_factor * 0.20)
         else:
             temp_factor = max(6500.0 - temp_kelvin, 4500.0) / 4500.0
-            img[:, :, 2] *= np.float32(1.0 + temp_factor * 0.30)
-            img[:, :, 0] *= np.float32(1.0 - temp_factor * 0.15)
+            out[:, :, 2] *= np.float32(1.0 + temp_factor * 0.30)
+            out[:, :, 0] *= np.float32(1.0 - temp_factor * 0.15)
 
         if tint != 0.0:
-            img[:, :, 1] *= np.float32(1.0 + tint * 0.15)
+            out[:, :, 1] *= np.float32(1.0 + tint * 0.15)
         
-        return img.copy()
+        return out
+    
+class ValuesStage(PipelineStage):
+    def __init__(self):
+        super().__init__('values', ['exposure', 'contrast', 'whites', 'blacks', 'highlights', 'shadows', 'values_multiplier'])
+
+    def run(self, img, preset):
+        out = img.copy()
+
+        v_mult = preset.get('values_multiplier', 1.0)
+
+        exposure = preset.get('exposure', 0.0)
+        if exposure != 0.0:
+            out *= np.float32(2.0 ** exposure)
+
+        # 3. Contrast (Pivot around middle gray 0.18)
+        contrast = preset.get('contrast', 0.0) * v_mult
+        if contrast != 0.0:
+            pivot = np.float32(0.18) 
+            out = (out - pivot) * np.float32(1.0 + contrast) + pivot
+            out = np.maximum(out, np.float32(0.0))
+
+        # 4. Whites & Blacks (Soft shoulder/toe)
+        whites = preset.get('whites', 0.0) * v_mult
+        blacks = preset.get('blacks', 0.0) * v_mult
+
+        # 5. Highlights & Shadows
+        highlights = preset.get('highlights', 0.0) * v_mult
+        shadows = preset.get('shadows', 0.0) * v_mult
+
+        if whites != 0.0 or blacks != 0.0 or highlights != 0.0 or shadows != 0.0:
+            # calculate shared luminance 
+            lum = np.float32(0.2126) * out[:, :, 0] + np.float32(0.7152) * out[:, :, 1] + np.float32(0.0722) * out[:, :, 2]
+            lum_safe = np.maximum(lum, np.float32(1e-6))
+            new_lum = lum.copy()
+        
+            if whites != 0.0:
+                w_mask = np.clip((lum - np.float32(0.5)) * np.float32(2.0), 0.0, 1.0)
+                new_lum += (whites * np.float32(0.25)) * (w_mask ** 2) * lum
+                new_lum = np.maximum(new_lum, np.float32(0.0))
+
+            if blacks != 0.0:
+                b_mask = np.clip((np.float32(0.3) - lum) * np.float32(3.33), 0.0, 1.0)
+                new_lum += (blacks * np.float32(0.15)) * (b_mask ** 2)
+                new_lum = np.maximum(new_lum, np.float32(0.0))
+
+            if highlights != 0.0:
+                hl_range = np.clip((lum - np.float32(0.5)) * np.float32(2.0), 0.0, 1.0)
+                hl_mask = hl_range * hl_range * (np.float32(3.0) - np.float32(2.0) * hl_range)
+                if highlights < 0.0:
+                    new_lum *= (np.float32(1.0) + (highlights * hl_mask * np.float32(0.5)))
+                else:
+                    safe_headroom = np.maximum(np.float32(0.0), np.float32(1.0) - lum)
+                    new_lum += highlights * hl_mask * safe_headroom * np.float32(0.7)
+
+            if shadows != 0.0:
+                sh_range = np.clip((np.float32(0.5) - lum) * np.float32(2.0), 0.0, 1.0)
+                sh_mask = sh_range * sh_range * (np.float32(3.0) - np.float32(2.0) * sh_range)
+                if shadows > 0.0:
+                    new_lum += shadows * sh_mask * (np.sqrt(lum_safe) - lum) * np.float32(0.8)
+                else:
+                    new_lum *= (np.float32(1.0) + (shadows * sh_mask * np.float32(0.5)))
+
+            out *= np.expand_dims(new_lum / lum_safe, axis=2)
+    
+        return out
+
+# TODO: extract from "run_pipeline" the different stages to have. Keep them few, because we have to hold results in memory
 
 class PipelineState:
     def __init__(self):
         self.stages = {
             'wb': WBStage(),
-            # 'exposure': PipelineStage('exposure', ['exposure']),
-            # 'contrast': PipelineStage('contrast', ['contrast', 'values_multiplier']),
+            'values' : ValuesStage()
             # 'curves': CurvesStage(),
             # 'bloom': PipelineStage('bloom', ['bloom', 'bloom_radius'])
         }
-        self.order = ['wb', 'exposure', 'contrast', 'curves', 'bloom']
+        self.order = ['wb', 'values', 'curves', 'bloom']
 
-    def process(self, stage_name, preset, input_data, compute_func):
+    def process(self, stage_name, preset, input_data):
         stage = self.stages[stage_name]
         
-        # Self-Check: Is this stage dirty?
+        # A stage is dirty if:
+        # 1. Its own settings changed (is_dirty)
+        # 2. Its cached data was cleared by an upstream stage (stage.data is None)
         if stage.is_dirty(preset) or stage.data is None:
-            # If dirty, recompute and store
-            stage.data = compute_func(input_data, preset).copy()
-        
+            # Trigger cascading invalidation for everything AFTER this
+            idx = self.order.index(stage_name)
+            for subsequent in self.order[idx+1:]:
+                if subsequent in self.stages:
+                    self.stages[subsequent].data = None
+            
+            print(f'Processing stage {stage.name}')
+            stage.data = stage.run(input_data, preset)
+
         return stage.data
 
 
@@ -531,7 +606,6 @@ class PhotoEditor:
 
             img *= np.expand_dims(new_lum / lum_safe, axis=2)
         
-        return img
         # 6. Texture (High-Frequency Local Detail - Dynamic Kernel Scaling)
         texture = preset.get('texture', 0.0)
         if texture != 0.0:
@@ -668,7 +742,7 @@ class PhotoEditor:
         np.clip(img, 0.0, 1.0, out=img)
         return img
 
-    def run_parallel_pipeline(self, src_matrix: np.ndarray, preset: Dict[str, Any], fast_preview : bool = False) -> np.ndarray:
+    def run_parallel_pipeline(self, src_matrix: np.ndarray, preset: Dict[str, Any], pipeline_state : PipelineState, fast_preview : bool = False) -> np.ndarray:
         """Scales pre-cropped image matrices to match compression dimensions, then processes tiles concurrently.
 
         Args:
@@ -681,6 +755,11 @@ class PhotoEditor:
         """
 
         # TODO: we need to do stage validation here to determine what to process.
+        if pipeline_state is None:
+            # We won't have or need this in non-interactive modes
+            state = PipelineState()
+        else:
+            state = pipeline_state
 
         h, w, c = src_matrix.shape
         active_crop_variant = preset.get('active_crop_variant', 'default')
@@ -693,37 +772,46 @@ class PhotoEditor:
                 aspect_ratio = h / w
                 src_matrix = cv2.resize(src_matrix, (target_w, int(target_w * aspect_ratio)), interpolation=cv2.INTER_LANCZOS4)
         else:
+            # TODO: if the ui has instagram compression off then we do 100% pixel calculation which is very slow. Integrate fast preview
             pct = int(crop_variant_data.get('resolution_percentage', 100)) / 100.0
             if pct < 1.0:
                 src_matrix = cv2.resize(src_matrix, (int(w * pct), int(h * pct)), interpolation=cv2.INTER_LANCZOS4)
         
         h, w, c = src_matrix.shape
-        if h < 32 or w < 32:
-            return self.run_pipeline(src_matrix, preset, fast_preview=fast_preview)
+        wb_img = state.process('wb', preset, src_matrix)
+        values_img = state.process('values', preset, wb_img)
 
-        output_matrix = np.empty_like(src_matrix)
-        cores = os.cpu_count() or 4
-        stripe_height = h // cores
-        margin = max(16, min(64, h // 8))
+        if not fast_preview:
+            # do the rest
+            pass
+        return values_img
 
-        def process_stripe(stripe_idx):
-            y_start = stripe_idx * stripe_height
-            y_end = h if stripe_idx == (cores - 1) else (stripe_idx + 1) * stripe_height
+        # if h < 32 or w < 32:
+        #     return self.run_pipeline(src_matrix, preset, fast_preview=fast_preview)
 
-            pad_start = max(0, y_start - margin)
-            pad_end = min(h, y_end + margin)
+        # output_matrix = np.empty_like(src_matrix)
+        # cores = os.cpu_count() or 4
+        # stripe_height = h // cores
+        # margin = max(16, min(64, h // 8))
 
-            stripe_input = src_matrix[pad_start:pad_end, :, :]
-            processed_stripe = self.run_pipeline(stripe_input, preset, fast_preview=fast_preview)
+        # def process_stripe(stripe_idx):
+        #     y_start = stripe_idx * stripe_height
+        #     y_end = h if stripe_idx == (cores - 1) else (stripe_idx + 1) * stripe_height
 
-            offset = y_start - pad_start
-            slice_length = y_end - y_start
-            output_matrix[y_start:y_end, :, :] = processed_stripe[offset : offset + slice_length, :, :]
+        #     pad_start = max(0, y_start - margin)
+        #     pad_end = min(h, y_end + margin)
 
-        with ThreadPoolExecutor(max_workers=cores) as executor:
-            executor.map(process_stripe, range(cores))
+        #     stripe_input = src_matrix[pad_start:pad_end, :, :]
+        #     processed_stripe = self.run_pipeline(stripe_input, preset, fast_preview=fast_preview)
 
-        return output_matrix
+        #     offset = y_start - pad_start
+        #     slice_length = y_end - y_start
+        #     output_matrix[y_start:y_end, :, :] = processed_stripe[offset : offset + slice_length, :, :]
+
+        # with ThreadPoolExecutor(max_workers=cores) as executor:
+        #     executor.map(process_stripe, range(cores))
+
+        # return output_matrix
 
     @staticmethod
     def apply_crop(img: np.ndarray, crop_data: Dict[str, Any]) -> np.ndarray:
