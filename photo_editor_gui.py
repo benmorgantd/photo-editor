@@ -1102,11 +1102,14 @@ class MainWindow(QMainWindow):
         print(f'applying film profile {profile_name}')
         if profile_name is None:
             self.preset['rgb_curves'] = PhotoEditor.DEFAULT_PRESET['rgb_curves']
+            self.preset.setdefault('color_matrix', PhotoEditor.DEFAULT_PRESET['color_matrix'])
         else:
             self.preset.setdefault('rgb_curves', PhotoEditor.DEFAULT_PRESET['rgb_curves'])
             for color in 'rgb':
                 curve_values = FILM_PROFILES[profile_name][color]
                 self.preset['rgb_curves'][color][1] = curve_values
+            self.preset.setdefault('color_matrix', PhotoEditor.DEFAULT_PRESET['color_matrix'])
+            self.preset['color_matrix'] = FILM_PROFILES[profile_name]['color_matrix']
         
         self._apply_preset_to_ui()
         self._save_current_edits_to_session_cache()

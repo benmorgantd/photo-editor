@@ -53,34 +53,59 @@ RAW_EXTENSIONS = ('.raf', '.cr2', '.nef', '.arw', '.dng', '.RAF', '.CR2', '.NEF'
 SUPPORTED_EXTENSIONS = IMAGE_EXTENSIONS + RAW_EXTENSIONS
 FILM_PROFILES = {
     'Portra 400' : {
-        'v':[0.04, 0.28, 0.52, 0.76, 0.97],
-        'r':[0.05, 0.30, 0.55, 0.79, 0.98],
-        'g':[0.04, 0.28, 0.52, 0.76, 0.97],
-        'b':[0.06, 0.26, 0.48, 0.73, 0.94]
+        'v': [0.04, 0.28, 0.52, 0.76, 0.97],
+        'r': [0.05, 0.30, 0.55, 0.79, 0.98],
+        'g': [0.04, 0.28, 0.52, 0.76, 0.97],
+        'b': [0.06, 0.26, 0.48, 0.73, 0.94],
+        'color_matrix': [
+            [ 1.06, -0.04, -0.02], # Warms up skin tones (pushes red, pulls green)
+            [-0.04,  1.02,  0.02], # Keeps greens natural but slightly muted
+            [-0.02,  0.06,  0.96]  # Bleeds green into blue for the signature Portra "cyan sky"
+        ]
     },
     'Velvia 50' : {
-        'v':[0.00, 0.18, 0.50, 0.84, 1.00],
-        'r':[0.00, 0.20, 0.54, 0.86, 1.00],
-        'g':[0.00, 0.18, 0.51, 0.85, 1.00],
-        'b':[0.02, 0.20, 0.48, 0.80, 0.98]
+        'v': [0.00, 0.18, 0.50, 0.84, 1.00],
+        'r': [0.00, 0.20, 0.54, 0.86, 1.00],
+        'g': [0.00, 0.18, 0.51, 0.85, 1.00],
+        'b': [0.02, 0.20, 0.48, 0.80, 0.98],
+        'color_matrix': [
+            [ 0.96,  0.06, -0.02], # Deepens reds slightly
+            [-0.05,  1.08, -0.03], # Aggressively purifies and punches greens (great for foliage)
+            [-0.02, -0.06,  1.08]  # Aggressively punches blues
+        ]
     },
     'Kodachrome 64' : {
-        'v':[0.01, 0.22, 0.51, 0.78, 0.96],
-        'r':[0.02, 0.26, 0.56, 0.82, 0.98],
-        'g':[0.01, 0.22, 0.51, 0.77, 0.95],
-        'b':[0.01, 0.19, 0.46, 0.71, 0.90]
+        'v': [0.01, 0.22, 0.51, 0.78, 0.96],
+        'r': [0.02, 0.26, 0.56, 0.82, 0.98],
+        'g': [0.01, 0.22, 0.51, 0.77, 0.95],
+        'b': [0.01, 0.19, 0.46, 0.71, 0.90],
+        'color_matrix': [
+            [ 1.10, -0.08, -0.02], # Very strong, rich reds (classic National Geographic look)
+            [-0.05,  1.05,  0.00], # Earthy, warm greens
+            [-0.03, -0.02,  1.05]  # Deep, saturated analog blues
+        ]
     },
     'Superia 400' : {
-        'v':[0.03, 0.25, 0.52, 0.78, 0.98],
-        'r':[0.03, 0.26, 0.52, 0.77, 0.98],
-        'g':[0.04, 0.27, 0.54, 0.79, 0.99],
-        'b':[0.05, 0.26, 0.49, 0.75, 0.96]
+        'v': [0.03, 0.25, 0.52, 0.78, 0.98],
+        'r': [0.03, 0.26, 0.52, 0.77, 0.98],
+        'g': [0.04, 0.27, 0.54, 0.79, 0.99],
+        'b': [0.05, 0.26, 0.49, 0.75, 0.96],
+        'color_matrix': [
+            [ 1.04, -0.02, -0.02], # Punchy consumer reds
+            [-0.03,  1.06, -0.03], # Fuji's "4th color layer" - strong green presence
+            [-0.05,  0.08,  0.97]  # Cool blues with a distinct green/cyan bleed
+        ]
     },
     'Kodak Gold' : {
-        'v':[0.04, 0.22, 0.50, 0.78, 0.98],
-        'r':[0.00, 0.24, 0.52, 0.76, 1.00],
-        'g':[0.00, 0.25, 0.50, 0.75, 1.00],
-        'b':[0.05, 0.23, 0.48, 0.73, 0.95]
+        'v': [0.04, 0.22, 0.50, 0.78, 0.98],
+        'r': [0.00, 0.24, 0.52, 0.76, 1.00],
+        'g': [0.00, 0.25, 0.50, 0.75, 1.00],
+        'b': [0.05, 0.23, 0.48, 0.73, 0.95],
+        'color_matrix': [
+            [ 1.08, -0.06, -0.02], # Strong yellow/gold bias in the reds
+            [ 0.04,  0.98, -0.02], # Bleeds red into green to push foliage warmer
+            [-0.02, -0.04,  1.06]  # Isolates blue to let the yellows/golds dominate the image
+        ]
     }
 }
 
@@ -92,7 +117,7 @@ class PhotoEditor:
         image_path (str): The absolute disk destination path to the targeted asset file.
         original_image (np.ndarray): High-precision floating-point source image matrix.
     """
-
+    # TODO: push film profile defaults to all existing json files
     DEFAULT_PRESET = {
             "apply_temperature_adjustment": True,
             "values_multiplier": 1.0, "color_multiplier": 1.0, "color_adjustments_multiplier": 1.0,
@@ -131,9 +156,9 @@ class PhotoEditor:
             },
             # 1. Tonality & Color Science
             "color_matrix": [
-                [ 1.06, -0.04, -0.02],
-                [-0.04,  1.02,  0.02],
-                [-0.02,  0.06,  0.96]
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0,  0.0],
+                [0.0, 0.0,  1.0]
             ],
             
             # 2. Optical Bloom
