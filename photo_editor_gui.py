@@ -171,7 +171,7 @@ class FullResLoaderWorker(QRunnable):
     def run(self):
         try:
             # This heavy I/O and matrix decoding now runs off the main event loop
-            matrix = PhotoEditor.load_image_matrix(self.file_path, preview=True)
+            matrix = PhotoEditor.load_image_matrix(self.file_path, preview=True, max_width=720)
             self.signals.finished.emit(self.file_path, matrix)
         except Exception as e:
             err_msg = f"{e}\n{traceback.format_exc()}"
@@ -856,7 +856,6 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Free Python Desktop Photo Editor by Ben Morgan")
         self.resize(1600, 950)
 
-        self.pipeline_state = PipelineState()
         self.crop_data_cache = {'cropped_matrix' : None, 'crop_data' : None}
 
         self.default_curve_vals = [0.0, 0.25, 0.5, 0.75, 1.0]
@@ -867,6 +866,7 @@ class MainWindow(QMainWindow):
 
         # Create a cache of the image matrices we load. These never change, even after edits.
         self.image_matrix_cache = dict()
+        self.pipeline_state_cache = dict()
 
         self.history_registry = dict()
 
@@ -2196,7 +2196,10 @@ class MainWindow(QMainWindow):
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
 
         # Invalidate the pipeline state! 
-        self.pipeline_state = None
+        # TODO: the pipeline state object has to be unique to the proxy or the preview matrix! 
+        # We can't have just one! 
+        self.pipeline_state_cache['proxy_pipeline_state'] = None
+        self.pipeline_state_cache['preview_pipeline_state'] = None
 
         # init a new instance of PhotoEditor so we can cache edits
         self.photo_editor_instance = PhotoEditor(self.current_file_path)
@@ -2314,7 +2317,12 @@ class MainWindow(QMainWindow):
             return
 
         # Use a lower-res proxy matrix during active slider dragging
-        source_matrix = self.proxy_matrix.copy() if self.is_scrubbing else self.preview_matrix.copy()
+        if self.is_scrubbing:
+            source_matrix = self.proxy_matrix
+            pipeline_state = self.pipeline_state_cache.get('proxy_pipeline_state', PipelineState())
+        else:
+            source_matrix = self.preview_matrix
+            pipeline_state = self.pipeline_state_cache.get('preview_pipeline_state', PipelineState())
 
         if self.show_original_state:
             render_array = source_matrix
@@ -2338,7 +2346,7 @@ class MainWindow(QMainWindow):
             #         self.crop_data_cache['cropped_preview_matrix'] = cropped_preview.copy()
             cropped_preview = PhotoEditor.apply_crop(source_matrix, self.active_crop_data)
 
-            render_array = self.photo_editor_instance.run_parallel_pipeline(cropped_preview, self.preset, self.pipeline_state, fast_preview=self.is_scrubbing)  # This takes 4 seconds
+            render_array = self.photo_editor_instance.run_parallel_pipeline(cropped_preview, self.preset, pipeline_state, fast_preview=self.is_scrubbing)  # This takes 4 seconds
 
         # Trigger histogram asynchronously or on downsampled data to prevent UI blocks
         self.histogram_widget.render_histogram(render_array)
