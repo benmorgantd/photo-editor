@@ -163,16 +163,15 @@ class ImageLoaderSignals(QObject):
 
 class FullResLoaderWorker(QRunnable):
     """Worker task that decodes full-resolution matrices in a background thread pool."""
-    def __init__(self, file_path: str, view_width: int):
+    def __init__(self, file_path: str):
         super().__init__()
         self.file_path = file_path
         self.signals = ImageLoaderSignals()
-        self.view_width = view_width
 
     def run(self):
         try:
             # This heavy I/O and matrix decoding now runs off the main event loop
-            matrix = PhotoEditor.load_image_matrix(self.file_path, preview=True, max_width=min(1024, self.view_width))
+            matrix = PhotoEditor.load_image_matrix(self.file_path, preview=True)
             self.signals.finished.emit(self.file_path, matrix)
         except Exception as e:
             err_msg = f"{e}\n{traceback.format_exc()}"
@@ -1131,7 +1130,6 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Preset configurations injected onto active workspace matrix.")
     
     def _apply_film_profile(self, profile_name):
-        print(f'applying film profile {profile_name}')
         if profile_name is None:
             self.preset['rgb_curves'] = PhotoEditor.DEFAULT_PRESET['rgb_curves']
             self.preset.setdefault('color_matrix', PhotoEditor.DEFAULT_PRESET['color_matrix'])
@@ -1404,7 +1402,6 @@ class MainWindow(QMainWindow):
     
     def _apply_auto_edits_to_folder(self):
         folder_path = self.file_model.filePath(self.tree_view.rootIndex())
-        print(folder_path)
         folder_name = os.path.basename(folder_path)
 
         # display a warning
@@ -2115,10 +2112,10 @@ class MainWindow(QMainWindow):
             self._update_nested_crop_variant_preset(key, value)
         else:
             self.preset[key] = value
-        if not self.is_updating_ui:
-            self._update_target_resolution_label()
-            self._save_current_edits_to_session_cache()
-            self._refresh_viewport()
+            if not self.is_updating_ui:
+                self._update_target_resolution_label()
+                self._save_current_edits_to_session_cache()
+                self._refresh_viewport()
 
     def _update_nested_color_preset(self, band: str, prop: str, value: float):
         """Modifies targeted spectral value slots inside isolated sub-dictionaries.
@@ -2198,6 +2195,9 @@ class MainWindow(QMainWindow):
         logger.info(f"Target file workspace selected node swap focus: {path}")
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
 
+        # Invalidate the pipeline state! 
+        self.pipeline_state = None
+
         # init a new instance of PhotoEditor so we can cache edits
         self.photo_editor_instance = PhotoEditor(self.current_file_path)
 
@@ -2211,12 +2211,12 @@ class MainWindow(QMainWindow):
             if stored_proxy_matrix is not None:
                 self.proxy_matrix = stored_proxy_matrix.copy()
             else:
-                self.proxy_matrix = PhotoEditor.load_image_matrix(self.current_file_path, preview=True, max_width=min(self.view.width(), 512))
+                self.proxy_matrix = PhotoEditor.load_image_matrix(self.current_file_path, preview=True, max_width=512)
                 self.image_matrix_cache.setdefault(self.current_file_path, dict())
                 self.image_matrix_cache[self.current_file_path]['proxy_matrix'] = self.proxy_matrix.copy()
             
             # Temporarily point preview_matrix to the proxy so the UI renders immediately
-            self.preview_matrix = self.proxy_matrix
+            self.preview_matrix = self.proxy_matrix.copy()
             self.preset = self._read_preset_from_manifest(path)
 
             # TODO: we could cache this metadata
@@ -2249,8 +2249,11 @@ class MainWindow(QMainWindow):
             # 4. Dispatch the background task for the full-resolution matrix
             stored_preview_matrix = self.image_matrix_cache.get(self.current_file_path, dict()).get('preview_matrix')
             if stored_preview_matrix is not None:
+                print('using stored preview matrix')
                 self.preview_matrix = stored_preview_matrix.copy()
+                self._on_fullres_load_complete(self.current_file_path, self.preview_matrix)
             else:
+                print('starting fullres background load of preview matrix')
                 self._start_background_fullres_load(path)
 
             # TODO: start a thread loading the proxy matrices for the surrounding 10 files in the tree
@@ -2267,7 +2270,7 @@ class MainWindow(QMainWindow):
 
     def _start_background_fullres_load(self, path: str):
         """Spawns a background thread to load the full-res matrix without blocking the UI."""
-        worker = FullResLoaderWorker(path, self.view.width())
+        worker = FullResLoaderWorker(path)
         worker.signals.finished.connect(self._on_fullres_load_complete)
         worker.signals.error.connect(self._on_fullres_load_error)
         self.thread_pool.start(worker)
@@ -2280,7 +2283,7 @@ class MainWindow(QMainWindow):
             return
 
         logger.info(f"Background full-res load complete for: {loaded_path}")
-        self.preview_matrix = full_matrix
+        self.preview_matrix = full_matrix.copy()
         self.image_matrix_cache.setdefault(self.current_file_path, dict())
         self.image_matrix_cache[self.current_file_path]['preview_matrix'] = self.preview_matrix.copy()
         
@@ -2311,19 +2314,29 @@ class MainWindow(QMainWindow):
             return
 
         # Use a lower-res proxy matrix during active slider dragging
-        source_matrix = self.proxy_matrix if self.is_scrubbing else self.preview_matrix
+        source_matrix = self.proxy_matrix.copy() if self.is_scrubbing else self.preview_matrix.copy()
 
         if self.show_original_state:
             render_array = source_matrix
         else:
             # TODO: we could probably cache the cropped preview if crop data hasn't changed.
             # TODO: we need to invalidate active crop data when we switch images
-            if self.active_crop_data == self.crop_data_cache.get('crop_data'):
-                cropped_preview = self.crop_data_cache['cropped_matrix']
-            else:
-                cropped_preview = PhotoEditor.apply_crop(source_matrix, self.active_crop_data)
-                self.crop_data_cache['crop_data'] = self.active_crop_data.copy()
-                self.crop_data_cache['cropped_matrix'] = cropped_preview.copy()
+            # cropped_preview = None
+            # if self.active_crop_data == self.crop_data_cache.get('crop_data'):
+            #     if self.is_scrubbing:
+            #         cropped_preview = self.crop_data_cache.get('cropped_proxy_matrix')
+            #     else:
+            #         cropped_preview = self.crop_data_cache.get('cropped_preview_matrix')
+            
+            # if cropped_preview is None:
+            #     cropped_preview = PhotoEditor.apply_crop(source_matrix, self.active_crop_data)
+            #     self.crop_data_cache['crop_data'] = self.active_crop_data.copy()
+
+            #     if self.is_scrubbing:
+            #         self.crop_data_cache['cropped_proxy_matrix'] = cropped_preview.copy()
+            #     else:
+            #         self.crop_data_cache['cropped_preview_matrix'] = cropped_preview.copy()
+            cropped_preview = PhotoEditor.apply_crop(source_matrix, self.active_crop_data)
 
             render_array = self.photo_editor_instance.run_parallel_pipeline(cropped_preview, self.preset, self.pipeline_state, fast_preview=self.is_scrubbing)  # This takes 4 seconds
 
@@ -2610,6 +2623,7 @@ class MainWindow(QMainWindow):
             self.crop_variant_combo.setCurrentIndex(max(variant_index - 1), 0)
 
 def main():
+
     """Application wrapper baseline launcher method layer entry point configuration loop."""
     app = QApplication(sys.argv)
     window = MainWindow()

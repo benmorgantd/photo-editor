@@ -129,9 +129,29 @@ class PipelineStage:
             return True
         return False
 
+    def is_dirty_nested_keys(self, preset):
+        '''Use when the stage has nested key values'''
+
+        # 1. Extract only the keys this stage cares about. Json dumps will work for our nested case
+        current_params = {k: preset.get(k) for k in self.param_keys}
+        
+        # 2. Serialize to a deterministic string
+        # sort_keys=True is vital for dictionary consistency
+        param_string = json.dumps(current_params, sort_keys=True)
+        
+        # 3. Hash the string
+        param_hash = hash(param_string)
+        
+        if param_hash != self.last_params:
+            self.last_params = param_hash
+            return True
+        return False
+
     def run(self, img, preset):
         raise NotImplementedError()
-    
+
+# TODO: crop stage first
+
 class WBStage(PipelineStage):
     def __init__(self):
         super().__init__('wb', ['temp_kelvin', 'tint', 'apply_temperature_adjustment'])
@@ -154,6 +174,7 @@ class WBStage(PipelineStage):
             out[:, :, 1] *= np.float32(1.0 + tint * 0.15)
         
         return out
+
     
 class ValuesStage(PipelineStage):
     def __init__(self):
@@ -220,17 +241,187 @@ class ValuesStage(PipelineStage):
     
         return out
 
+
+class ColorStage(PipelineStage):
+    def __init__(self):
+        # NOTE: Because of the nested 
+        super().__init__('color', ['color_multiplier', 'color_adjustments_multiplier', 'vibrance', 'saturation', 'color_adjustments', 'rgb_curves'])
+    
+    def is_dirty(self, preset):
+        return self.is_dirty_nested_keys(preset)
+
+    def run(self, img, preset):
+        out = img.copy()
+
+        # 8. Saturation & Vibrance (HDR-Compatible Grayscale Interpolation)
+
+        c_mult = np.clip(preset.get('color_multiplier', 1.0), 0.0, 1.0)
+        ca_mult = np.clip(preset.get('color_adjustments_multiplier', 1.0), 0.0, 1.0)
+        vibrance = preset.get('vibrance', 0.0) * c_mult
+        saturation = preset.get('saturation', 0.0) * c_mult
+
+        # TODO:
+        # C:\Users\bmorgan\Documents\dev\python\photo_editor\photo_editor_core.py:272: RuntimeWarning: invalid value encountered in divide
+        #   sat_mask = np.where(max_rgb > 1e-5, (max_rgb - min_rgb) / max_rgb, np.float32(0.0))
+        
+        if saturation != 0.0 or vibrance != 0.0:
+            lum_matrix = (np.float32(0.2126) * out[:, :, 0] + 
+                          np.float32(0.7152) * out[:, :, 1] + 
+                          np.float32(0.0722) * out[:, :, 2])
+            grayscale = np.expand_dims(lum_matrix, axis=2)
+            
+            if vibrance != 0.0:
+                max_rgb = np.max(out, axis=2, keepdims=True)
+                min_rgb = np.min(out, axis=2, keepdims=True)
+                sat_mask = np.where(max_rgb > 1e-5, (max_rgb - min_rgb) / max_rgb, np.float32(0.0))
+                vib_factor = np.float32(vibrance) * (np.float32(1.0) - sat_mask)
+                out = grayscale + (out - grayscale) * (np.float32(1.0) + vib_factor)
+
+            if saturation != 0.0:
+                sat_factor = np.maximum(np.float32(1.0 + saturation), np.float32(0.0))
+                out = grayscale + (out - grayscale) * sat_factor
+        
+        # 9. 8-Band Color Adjustments (Luminance-Preserved HDR Chroma Mapping)
+        color_adj = preset.get('color_adjustments', {})
+        if color_adj and ca_mult > 0.0:
+            # Save original unbounded HDR luminance to prevent highlight clipping during HSV math
+            orig_lum = (np.float32(0.2126) * out[:, :, 0] + 
+                        np.float32(0.7152) * out[:, :, 1] + 
+                        np.float32(0.0722) * out[:, :, 2])
+            orig_lum_safe = np.maximum(orig_lum, np.float32(1e-6))
+
+            # Normalize to [0, 1] purely for safe OpenCV HSV conversion
+            safe_rgb = np.clip(out, 0.0, 1.0)
+            hsv = cv2.cvtColor(safe_rgb, cv2.COLOR_RGB2HSV)
+            
+            bands_config = {
+                'red': {'center': 0.0, 'width': 22.0},
+                'orange': {'center': 30.0, 'width': 15.0},
+                'yellow': {'center': 60.0, 'width': 20.0},
+                'green': {'center': 120.0, 'width': 40.0},
+                'aqua': {'center': 175.0, 'width': 25.0},
+                'blue': {'center': 225.0, 'width': 35.0},
+                'purple': {'center': 275.0, 'width': 25.0},
+                'magenta': {'center': 315.0, 'width': 25.0}
+            }
+
+            h_matrix = hsv[:, :, 0]
+            s_matrix = hsv[:, :, 1]
+            total_h_delta = np.zeros_like(h_matrix)
+            total_s_mod = np.zeros_like(s_matrix)
+            has_adjustments = False
+
+            for band, cfg in bands_config.items():
+                adjustments = color_adj.get(band, {"hue": 0.0, "sat": 0.0})
+                h_shift = float(adjustments.get('hue', 0.0) * 180.0 * ca_mult)
+                s_shift = float(adjustments.get('sat', 0.0) * ca_mult)
+
+                if h_shift == 0.0 and s_shift == 0.0:
+                    continue
+                
+                has_adjustments = True
+                diff = np.abs(h_matrix - cfg['center'])
+                diff = np.minimum(diff, 360.0 - diff)
+                weight = np.clip(1.0 - (diff / cfg['width']), 0.0, 1.0)
+                weight = 0.5 * (1.0 - np.cos(weight * np.pi))
+
+                if h_shift != 0.0:
+                    total_h_delta += (weight * h_shift)
+                if s_shift != 0.0:
+                    total_s_mod += (weight * s_shift)
+
+            if has_adjustments:
+                hsv[:, :, 0] = (hsv[:, :, 0] + total_h_delta) % 360.0
+                pos_mask = (total_s_mod >= 0.0)
+                neg_mask = ~pos_mask
+                
+                s_matrix[pos_mask] = s_matrix[pos_mask] * (1.0 + total_s_mod[pos_mask]) + (total_s_mod[pos_mask] * 0.2)
+                s_matrix[neg_mask] = s_matrix[neg_mask] * (1.0 + total_s_mod[neg_mask])
+                hsv[:, :, 1] = np.clip(s_matrix, 0.0, 1.0)
+
+                # Convert back to RGB and scale by original HDR luminance ratio!
+                new_rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB).astype(np.float32)
+                new_lum = (np.float32(0.2126) * new_rgb[:, :, 0] + 
+                           np.float32(0.7152) * new_rgb[:, :, 1] + 
+                           np.float32(0.0722) * new_rgb[:, :, 2])
+                new_lum_safe = np.maximum(new_lum, np.float32(1e-6))
+                
+                out = new_rgb * np.expand_dims(orig_lum / new_lum_safe, axis=2)
+        
+        # 10. Profile RGB Curves (Procedural 1D LUTs)
+        # Interpolates channel values rapidly for split-toning effects.
+        rgb_curves = preset.get('rgb_curves', None)
+        if rgb_curves:
+            for i, channel in enumerate(['r', 'g', 'b']):
+                if channel in rgb_curves:
+                    xp, yp = rgb_curves[channel]
+                    # Note: xp and yp must be monotonically increasing.
+                    out[:, :, i] = np.interp(out[:, :, i], xp, yp)
+        
+        return out
+
+
+class FilmStage(PipelineStage):
+    def __init__(self):
+        # TODO: maybe break this up into further steps
+        super().__init__('film', [
+            'texture', 'clarity', 'color_matrix', 'bloom_threshold', 'bloom_radius', 'bloom_strength',
+            'halation_threshold', 'halation_radius', 'halation_strength', 'halation_offset_x', 'halation_offset_y',
+            'grain_strength', 'grain_size', 'grain_chroma',
+            'vignette_strength', 'vignette_blur', 'vignette_radius', 'corner_blur_radius'
+        ])
+
+    def is_dirty(self, preset):
+        return self.is_dirty_nested_keys(preset)
+    
+    def run(self, img, preset):
+        out = img.copy()
+        h, w, _ = img.shape
+        max_dim = max(h, w)
+
+        # Texture (High-Frequency Local Detail - Dynamic Kernel Scaling)
+        texture = preset.get('texture', 0.0)
+        if texture != 0.0:
+            t_k = max(3, int(max_dim * 0.005) | 1)
+            low_pass_tex = cv2.GaussianBlur(img, (t_k, t_k), 0)
+            high_freq = img - low_pass_tex
+            img += np.float32(texture * 0.5) * high_freq
+
+        # Clarity (Mid-Frequency Local Contrast - Dynamic Wide Kernel)
+        clarity = preset.get('clarity', 0.0)
+        if clarity != 0.0:
+            c_k = max(5, int(max_dim * 0.05) | 1)
+            low_pass_clarity = cv2.GaussianBlur(img, (c_k, c_k), 0)
+            mid_freq = img - low_pass_clarity
+            img += np.float32(clarity * 0.4) * mid_freq
+
+
+        # Film Simulation methods
+        out = apply_color_matrix(out, preset)
+        out = apply_bloom(out, preset)
+        out = apply_halation(out, preset)
+        out = apply_smart_grain(out, preset)
+        out = apply_vignette_and_softness(out, preset)
+
+        # Display Preparation: Tonemapping at the end of float processing
+        hdr_comp = preset.get('hdr_compression', 0.0)
+        if hdr_comp > 0.0:
+            out = apply_sdr_preview(out, hdr_comp)
+            pass
+
+        return out
+
 # TODO: extract from "run_pipeline" the different stages to have. Keep them few, because we have to hold results in memory
 
 class PipelineState:
     def __init__(self):
         self.stages = {
             'wb': WBStage(),
-            'values' : ValuesStage()
-            # 'curves': CurvesStage(),
-            # 'bloom': PipelineStage('bloom', ['bloom', 'bloom_radius'])
+            'values' : ValuesStage(),
+            'color' : ColorStage(),
+            'film' : FilmStage()
         }
-        self.order = ['wb', 'values', 'curves', 'bloom']
+        self.order = ['wb', 'values', 'color', 'film']
 
     def process(self, stage_name, preset, input_data):
         stage = self.stages[stage_name]
@@ -245,7 +436,7 @@ class PipelineState:
                 if subsequent in self.stages:
                     self.stages[subsequent].data = None
             
-            print(f'Processing stage {stage.name}')
+            # print(f'Processing stage {stage.name}')
             stage.data = stage.run(input_data, preset)
 
         return stage.data
@@ -365,6 +556,7 @@ class PhotoEditor:
                     
                     # Resize the 16-bit integer array BEFORE converting to float32
                     if preview and rgb_16.shape[1] > max_width:
+                        print('resizing to scale to max width')
                         scale = float(max_width) / rgb_16.shape[1]
                         new_height = int(rgb_16.shape[0] * scale)
                         rgb_16 = cv2.resize(rgb_16, (max_width, new_height), interpolation=cv2.INTER_AREA)
@@ -529,82 +721,82 @@ class PhotoEditor:
         Returns:
             np.ndarray: Fully processed floating-point RGB matrix layout.
         """
-        img = np.copy(src_matrix).astype(np.float32)
-        h, w, _ = img.shape
-        max_dim = max(h, w)
+        # img = np.copy(src_matrix).astype(np.float32)
+        # h, w, _ = img.shape
+        # max_dim = max(h, w)
 
-        v_mult = np.clip(preset.get('values_multiplier', 1.0), 0.0, 1.0)
-        c_mult = np.clip(preset.get('color_multiplier', 1.0), 0.0, 1.0)
-        ca_mult = np.clip(preset.get('color_adjustments_multiplier', 1.0), 0.0, 1.0)
+        # v_mult = np.clip(preset.get('values_multiplier', 1.0), 0.0, 1.0)
+        # c_mult = np.clip(preset.get('color_multiplier', 1.0), 0.0, 1.0)
+        # ca_mult = np.clip(preset.get('color_adjustments_multiplier', 1.0), 0.0, 1.0)
 
-        # 1. White Balance (Temperature & Tint via Multiplicative Gain)
-        apply_temp = preset.get('apply_temperature_adjustment', True)
-        temp_kelvin = preset.get('temp_kelvin', 6500.0)
-        tint = preset.get('tint', 0.0)
+        # # 1. White Balance (Temperature & Tint via Multiplicative Gain)
+        # apply_temp = preset.get('apply_temperature_adjustment', True)
+        # temp_kelvin = preset.get('temp_kelvin', 6500.0)
+        # tint = preset.get('tint', 0.0)
 
-        # TODO: only execute if step is dirty
-        img = self._apply_white_balance_adjustments(img, temp_kelvin, tint)
+        # # TODO: only execute if step is dirty
+        # img = self._apply_white_balance_adjustments(img, temp_kelvin, tint)
 
-        # 2. Exposure (1 EV = 2x multiplier)
-        exposure = preset.get('exposure', 0.0)
-        if exposure != 0.0:
-            img *= np.float32(2.0 ** exposure)
+        # # 2. Exposure (1 EV = 2x multiplier)
+        # exposure = preset.get('exposure', 0.0)
+        # if exposure != 0.0:
+        #     img *= np.float32(2.0 ** exposure)
 
-        # 3. Contrast (Pivot around middle gray 0.18)
-        contrast = preset.get('contrast', 0.0) * v_mult
-        if contrast != 0.0:
-            pivot = np.float32(0.18) 
-            img = (img - pivot) * np.float32(1.0 + contrast) + pivot
-            img = np.maximum(img, np.float32(0.0))
+        # # 3. Contrast (Pivot around middle gray 0.18)
+        # contrast = preset.get('contrast', 0.0) * v_mult
+        # if contrast != 0.0:
+        #     pivot = np.float32(0.18) 
+        #     img = (img - pivot) * np.float32(1.0 + contrast) + pivot
+        #     img = np.maximum(img, np.float32(0.0))
 
-        # 4. Whites & Blacks (Soft shoulder/toe)
-        whites = preset.get('whites', 0.0) * v_mult
-        blacks = preset.get('blacks', 0.0) * v_mult
+        # # 4. Whites & Blacks (Soft shoulder/toe)
+        # whites = preset.get('whites', 0.0) * v_mult
+        # blacks = preset.get('blacks', 0.0) * v_mult
         
-        if whites != 0.0 or blacks != 0.0:
-            lum = np.float32(0.2126) * img[:, :, 0] + np.float32(0.7152) * img[:, :, 1] + np.float32(0.0722) * img[:, :, 2]
-            lum_safe = np.maximum(lum, np.float32(1e-6))
-            new_lum = lum.copy()
+        # if whites != 0.0 or blacks != 0.0:
+        #     lum = np.float32(0.2126) * img[:, :, 0] + np.float32(0.7152) * img[:, :, 1] + np.float32(0.0722) * img[:, :, 2]
+        #     lum_safe = np.maximum(lum, np.float32(1e-6))
+        #     new_lum = lum.copy()
 
-            if whites != 0.0:
-                w_mask = np.clip((lum - np.float32(0.5)) * np.float32(2.0), 0.0, 1.0)
-                new_lum += (whites * np.float32(0.25)) * (w_mask ** 2) * lum
-                new_lum = np.maximum(new_lum, np.float32(0.0))
+        #     if whites != 0.0:
+        #         w_mask = np.clip((lum - np.float32(0.5)) * np.float32(2.0), 0.0, 1.0)
+        #         new_lum += (whites * np.float32(0.25)) * (w_mask ** 2) * lum
+        #         new_lum = np.maximum(new_lum, np.float32(0.0))
 
-            if blacks != 0.0:
-                b_mask = np.clip((np.float32(0.3) - lum) * np.float32(3.33), 0.0, 1.0)
-                new_lum += (blacks * np.float32(0.15)) * (b_mask ** 2)
-                new_lum = np.maximum(new_lum, np.float32(0.0))
+        #     if blacks != 0.0:
+        #         b_mask = np.clip((np.float32(0.3) - lum) * np.float32(3.33), 0.0, 1.0)
+        #         new_lum += (blacks * np.float32(0.15)) * (b_mask ** 2)
+        #         new_lum = np.maximum(new_lum, np.float32(0.0))
 
-            img *= np.expand_dims(new_lum / lum_safe, axis=2)
+        #     img *= np.expand_dims(new_lum / lum_safe, axis=2)
 
-        # 5. Highlights & Shadows
-        highlights = preset.get('highlights', 0.0) * v_mult
-        shadows = preset.get('shadows', 0.0) * v_mult
+        # # 5. Highlights & Shadows
+        # highlights = preset.get('highlights', 0.0) * v_mult
+        # shadows = preset.get('shadows', 0.0) * v_mult
 
-        if highlights != 0.0 or shadows != 0.0:
-            lum = np.float32(0.2126) * img[:, :, 0] + np.float32(0.7152) * img[:, :, 1] + np.float32(0.0722) * img[:, :, 2]
-            lum_safe = np.maximum(lum, np.float32(1e-6))
-            new_lum = lum.copy()
+        # if highlights != 0.0 or shadows != 0.0:
+        #     lum = np.float32(0.2126) * img[:, :, 0] + np.float32(0.7152) * img[:, :, 1] + np.float32(0.0722) * img[:, :, 2]
+        #     lum_safe = np.maximum(lum, np.float32(1e-6))
+        #     new_lum = lum.copy()
 
-            if highlights != 0.0:
-                hl_range = np.clip((lum - np.float32(0.5)) * np.float32(2.0), 0.0, 1.0)
-                hl_mask = hl_range * hl_range * (np.float32(3.0) - np.float32(2.0) * hl_range)
-                if highlights < 0.0:
-                    new_lum *= (np.float32(1.0) + (highlights * hl_mask * np.float32(0.5)))
-                else:
-                    safe_headroom = np.maximum(np.float32(0.0), np.float32(1.0) - lum)
-                    new_lum += highlights * hl_mask * safe_headroom * np.float32(0.7)
+        #     if highlights != 0.0:
+        #         hl_range = np.clip((lum - np.float32(0.5)) * np.float32(2.0), 0.0, 1.0)
+        #         hl_mask = hl_range * hl_range * (np.float32(3.0) - np.float32(2.0) * hl_range)
+        #         if highlights < 0.0:
+        #             new_lum *= (np.float32(1.0) + (highlights * hl_mask * np.float32(0.5)))
+        #         else:
+        #             safe_headroom = np.maximum(np.float32(0.0), np.float32(1.0) - lum)
+        #             new_lum += highlights * hl_mask * safe_headroom * np.float32(0.7)
 
-            if shadows != 0.0:
-                sh_range = np.clip((np.float32(0.5) - lum) * np.float32(2.0), 0.0, 1.0)
-                sh_mask = sh_range * sh_range * (np.float32(3.0) - np.float32(2.0) * sh_range)
-                if shadows > 0.0:
-                    new_lum += shadows * sh_mask * (np.sqrt(lum_safe) - lum) * np.float32(0.8)
-                else:
-                    new_lum *= (np.float32(1.0) + (shadows * sh_mask * np.float32(0.5)))
+        #     if shadows != 0.0:
+        #         sh_range = np.clip((np.float32(0.5) - lum) * np.float32(2.0), 0.0, 1.0)
+        #         sh_mask = sh_range * sh_range * (np.float32(3.0) - np.float32(2.0) * sh_range)
+        #         if shadows > 0.0:
+        #             new_lum += shadows * sh_mask * (np.sqrt(lum_safe) - lum) * np.float32(0.8)
+        #         else:
+        #             new_lum *= (np.float32(1.0) + (shadows * sh_mask * np.float32(0.5)))
 
-            img *= np.expand_dims(new_lum / lum_safe, axis=2)
+        #     img *= np.expand_dims(new_lum / lum_safe, axis=2)
         
         # 6. Texture (High-Frequency Local Detail - Dynamic Kernel Scaling)
         texture = preset.get('texture', 0.0)
@@ -622,103 +814,103 @@ class PhotoEditor:
             mid_freq = img - low_pass_clarity
             img += np.float32(clarity * 0.4) * mid_freq
 
-        # 8. Saturation & Vibrance (HDR-Compatible Grayscale Interpolation)
-        vibrance = preset.get('vibrance', 0.0) * c_mult
-        saturation = preset.get('saturation', 0.0) * c_mult
+        # # 8. Saturation & Vibrance (HDR-Compatible Grayscale Interpolation)
+        # vibrance = preset.get('vibrance', 0.0) * c_mult
+        # saturation = preset.get('saturation', 0.0) * c_mult
         
-        if saturation != 0.0 or vibrance != 0.0:
-            lum_matrix = (np.float32(0.2126) * img[:, :, 0] + 
-                          np.float32(0.7152) * img[:, :, 1] + 
-                          np.float32(0.0722) * img[:, :, 2])
-            grayscale = np.expand_dims(lum_matrix, axis=2)
+        # if saturation != 0.0 or vibrance != 0.0:
+        #     lum_matrix = (np.float32(0.2126) * img[:, :, 0] + 
+        #                   np.float32(0.7152) * img[:, :, 1] + 
+        #                   np.float32(0.0722) * img[:, :, 2])
+        #     grayscale = np.expand_dims(lum_matrix, axis=2)
             
-            if vibrance != 0.0:
-                max_rgb = np.max(img, axis=2, keepdims=True)
-                min_rgb = np.min(img, axis=2, keepdims=True)
-                sat_mask = np.where(max_rgb > 1e-5, (max_rgb - min_rgb) / max_rgb, np.float32(0.0))
-                vib_factor = np.float32(vibrance) * (np.float32(1.0) - sat_mask)
-                img = grayscale + (img - grayscale) * (np.float32(1.0) + vib_factor)
+        #     if vibrance != 0.0:
+        #         max_rgb = np.max(img, axis=2, keepdims=True)
+        #         min_rgb = np.min(img, axis=2, keepdims=True)
+        #         sat_mask = np.where(max_rgb > 1e-5, (max_rgb - min_rgb) / max_rgb, np.float32(0.0))
+        #         vib_factor = np.float32(vibrance) * (np.float32(1.0) - sat_mask)
+        #         img = grayscale + (img - grayscale) * (np.float32(1.0) + vib_factor)
 
-            if saturation != 0.0:
-                sat_factor = np.maximum(np.float32(1.0 + saturation), np.float32(0.0))
-                img = grayscale + (img - grayscale) * sat_factor
+        #     if saturation != 0.0:
+        #         sat_factor = np.maximum(np.float32(1.0 + saturation), np.float32(0.0))
+        #         img = grayscale + (img - grayscale) * sat_factor
         
-        # 9. 8-Band Color Adjustments (Luminance-Preserved HDR Chroma Mapping)
-        color_adj = preset.get('color_adjustments', {})
-        if color_adj and ca_mult > 0.0:
-            # Save original unbounded HDR luminance to prevent highlight clipping during HSV math
-            orig_lum = (np.float32(0.2126) * img[:, :, 0] + 
-                        np.float32(0.7152) * img[:, :, 1] + 
-                        np.float32(0.0722) * img[:, :, 2])
-            orig_lum_safe = np.maximum(orig_lum, np.float32(1e-6))
+        # # 9. 8-Band Color Adjustments (Luminance-Preserved HDR Chroma Mapping)
+        # color_adj = preset.get('color_adjustments', {})
+        # if color_adj and ca_mult > 0.0:
+        #     # Save original unbounded HDR luminance to prevent highlight clipping during HSV math
+        #     orig_lum = (np.float32(0.2126) * img[:, :, 0] + 
+        #                 np.float32(0.7152) * img[:, :, 1] + 
+        #                 np.float32(0.0722) * img[:, :, 2])
+        #     orig_lum_safe = np.maximum(orig_lum, np.float32(1e-6))
 
-            # Normalize to [0, 1] purely for safe OpenCV HSV conversion
-            safe_rgb = np.clip(img, 0.0, 1.0)
-            hsv = cv2.cvtColor(safe_rgb, cv2.COLOR_RGB2HSV)
+        #     # Normalize to [0, 1] purely for safe OpenCV HSV conversion
+        #     safe_rgb = np.clip(img, 0.0, 1.0)
+        #     hsv = cv2.cvtColor(safe_rgb, cv2.COLOR_RGB2HSV)
             
-            bands_config = {
-                'red': {'center': 0.0, 'width': 22.0},
-                'orange': {'center': 30.0, 'width': 15.0},
-                'yellow': {'center': 60.0, 'width': 20.0},
-                'green': {'center': 120.0, 'width': 40.0},
-                'aqua': {'center': 175.0, 'width': 25.0},
-                'blue': {'center': 225.0, 'width': 35.0},
-                'purple': {'center': 275.0, 'width': 25.0},
-                'magenta': {'center': 315.0, 'width': 25.0}
-            }
+        #     bands_config = {
+        #         'red': {'center': 0.0, 'width': 22.0},
+        #         'orange': {'center': 30.0, 'width': 15.0},
+        #         'yellow': {'center': 60.0, 'width': 20.0},
+        #         'green': {'center': 120.0, 'width': 40.0},
+        #         'aqua': {'center': 175.0, 'width': 25.0},
+        #         'blue': {'center': 225.0, 'width': 35.0},
+        #         'purple': {'center': 275.0, 'width': 25.0},
+        #         'magenta': {'center': 315.0, 'width': 25.0}
+        #     }
 
-            h_matrix = hsv[:, :, 0]
-            s_matrix = hsv[:, :, 1]
-            total_h_delta = np.zeros_like(h_matrix)
-            total_s_mod = np.zeros_like(s_matrix)
-            has_adjustments = False
+        #     h_matrix = hsv[:, :, 0]
+        #     s_matrix = hsv[:, :, 1]
+        #     total_h_delta = np.zeros_like(h_matrix)
+        #     total_s_mod = np.zeros_like(s_matrix)
+        #     has_adjustments = False
 
-            for band, cfg in bands_config.items():
-                adjustments = color_adj.get(band, {"hue": 0.0, "sat": 0.0})
-                h_shift = float(adjustments.get('hue', 0.0) * 180.0 * ca_mult)
-                s_shift = float(adjustments.get('sat', 0.0) * ca_mult)
+        #     for band, cfg in bands_config.items():
+        #         adjustments = color_adj.get(band, {"hue": 0.0, "sat": 0.0})
+        #         h_shift = float(adjustments.get('hue', 0.0) * 180.0 * ca_mult)
+        #         s_shift = float(adjustments.get('sat', 0.0) * ca_mult)
 
-                if h_shift == 0.0 and s_shift == 0.0:
-                    continue
+        #         if h_shift == 0.0 and s_shift == 0.0:
+        #             continue
                 
-                has_adjustments = True
-                diff = np.abs(h_matrix - cfg['center'])
-                diff = np.minimum(diff, 360.0 - diff)
-                weight = np.clip(1.0 - (diff / cfg['width']), 0.0, 1.0)
-                weight = 0.5 * (1.0 - np.cos(weight * np.pi))
+        #         has_adjustments = True
+        #         diff = np.abs(h_matrix - cfg['center'])
+        #         diff = np.minimum(diff, 360.0 - diff)
+        #         weight = np.clip(1.0 - (diff / cfg['width']), 0.0, 1.0)
+        #         weight = 0.5 * (1.0 - np.cos(weight * np.pi))
 
-                if h_shift != 0.0:
-                    total_h_delta += (weight * h_shift)
-                if s_shift != 0.0:
-                    total_s_mod += (weight * s_shift)
+        #         if h_shift != 0.0:
+        #             total_h_delta += (weight * h_shift)
+        #         if s_shift != 0.0:
+        #             total_s_mod += (weight * s_shift)
 
-            if has_adjustments:
-                hsv[:, :, 0] = (hsv[:, :, 0] + total_h_delta) % 360.0
-                pos_mask = (total_s_mod >= 0.0)
-                neg_mask = ~pos_mask
+        #     if has_adjustments:
+        #         hsv[:, :, 0] = (hsv[:, :, 0] + total_h_delta) % 360.0
+        #         pos_mask = (total_s_mod >= 0.0)
+        #         neg_mask = ~pos_mask
                 
-                s_matrix[pos_mask] = s_matrix[pos_mask] * (1.0 + total_s_mod[pos_mask]) + (total_s_mod[pos_mask] * 0.2)
-                s_matrix[neg_mask] = s_matrix[neg_mask] * (1.0 + total_s_mod[neg_mask])
-                hsv[:, :, 1] = np.clip(s_matrix, 0.0, 1.0)
+        #         s_matrix[pos_mask] = s_matrix[pos_mask] * (1.0 + total_s_mod[pos_mask]) + (total_s_mod[pos_mask] * 0.2)
+        #         s_matrix[neg_mask] = s_matrix[neg_mask] * (1.0 + total_s_mod[neg_mask])
+        #         hsv[:, :, 1] = np.clip(s_matrix, 0.0, 1.0)
 
-                # Convert back to RGB and scale by original HDR luminance ratio!
-                new_rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB).astype(np.float32)
-                new_lum = (np.float32(0.2126) * new_rgb[:, :, 0] + 
-                           np.float32(0.7152) * new_rgb[:, :, 1] + 
-                           np.float32(0.0722) * new_rgb[:, :, 2])
-                new_lum_safe = np.maximum(new_lum, np.float32(1e-6))
+        #         # Convert back to RGB and scale by original HDR luminance ratio!
+        #         new_rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB).astype(np.float32)
+        #         new_lum = (np.float32(0.2126) * new_rgb[:, :, 0] + 
+        #                    np.float32(0.7152) * new_rgb[:, :, 1] + 
+        #                    np.float32(0.0722) * new_rgb[:, :, 2])
+        #         new_lum_safe = np.maximum(new_lum, np.float32(1e-6))
                 
-                img = new_rgb * np.expand_dims(orig_lum / new_lum_safe, axis=2)
+        #         img = new_rgb * np.expand_dims(orig_lum / new_lum_safe, axis=2)
         
-        # 10. Profile RGB Curves (Procedural 1D LUTs)
-        # Interpolates channel values rapidly for split-toning effects.
-        rgb_curves = preset.get('rgb_curves', None)
-        if rgb_curves:
-            for i, channel in enumerate(['r', 'g', 'b']):
-                if channel in rgb_curves:
-                    xp, yp = rgb_curves[channel]
-                    # Note: xp and yp must be monotonically increasing.
-                    img[:, :, i] = np.interp(img[:, :, i], xp, yp)
+        # # 10. Profile RGB Curves (Procedural 1D LUTs)
+        # # Interpolates channel values rapidly for split-toning effects.
+        # rgb_curves = preset.get('rgb_curves', None)
+        # if rgb_curves:
+        #     for i, channel in enumerate(['r', 'g', 'b']):
+        #         if channel in rgb_curves:
+        #             xp, yp = rgb_curves[channel]
+        #             # Note: xp and yp must be monotonically increasing.
+        #             img[:, :, i] = np.interp(img[:, :, i], xp, yp)
 
         # Film Simulation methods
         img = apply_color_matrix(img, preset)
@@ -756,6 +948,7 @@ class PhotoEditor:
 
         # TODO: we need to do stage validation here to determine what to process.
         if pipeline_state is None:
+            # TODO: this instance has pipeline state... use the instance? 
             # We won't have or need this in non-interactive modes
             state = PipelineState()
         else:
@@ -780,11 +973,18 @@ class PhotoEditor:
         h, w, c = src_matrix.shape
         wb_img = state.process('wb', preset, src_matrix)
         values_img = state.process('values', preset, wb_img)
+        color_img = state.process('color', preset, values_img)
+        film_img = state.process('film', preset, color_img)
+        np.clip(film_img, 0.0, 1.0, out=film_img)
+        return film_img
 
-        if not fast_preview:
-            # do the rest
-            pass
-        return values_img
+        # if fast_preview:
+        #     np.clip(color_img, 0.0, 1.0, out=color_img)
+        #     return color_img
+        # else:
+        #     film_img = state.process('film', preset, color_img)
+        #     np.clip(film_img, 0.0, 1.0, out=film_img)
+        #     return film_img
 
         # if h < 32 or w < 32:
         #     return self.run_pipeline(src_matrix, preset, fast_preview=fast_preview)
@@ -1283,6 +1483,53 @@ def apply_vignette_and_softness(image: np.ndarray, params: dict) -> np.ndarray:
         
     # 4. Apply exposure falloff
     return np.clip(result * vignette_mask, 0.0, 1.0)
+
+def apply_sdr_preview(img: np.ndarray, intensity: float) -> np.ndarray:
+    """
+    Compresses HDR data into an SDR range (0.0 to 1.0), simulating Lightroom's 
+    'Preview for SDR Display'.
+    
+    Args:
+        img (np.ndarray): High precision source image (can contain values > 1.0).
+        intensity (float): 0.0 represents standard SDR clipping (no HDR compression).
+                            1.0 represents full ACES highlight roll-off.
+    
+    Returns:
+        np.ndarray: Bounded SDR image matrix in range [0.0, 1.0].
+    """
+    # Clamp intensity to valid range
+    intensity = float(np.clip(intensity, 0.0, 1.0))
+    
+    if intensity == 0.0:
+        # At 0 intensity, simulate standard SDR display clipping without tonemapping
+        return np.clip(img, 0.0, 1.0).astype(np.float32)
+
+    # Narkowicz ACES approximation coefficients
+    a = np.float32(2.51)
+    b = np.float32(0.03)
+    c = np.float32(2.43)
+    d = np.float32(0.59)
+    e = np.float32(0.14)
+
+    # Apply ACES curve directly without artificial exposure pre-scaling
+    tonemapped = (img * (a * img + b)) / (img * (c * img + d) + e)
+    
+    # Ensure mathematical precision errors don't drift outside [0, 1]
+    np.clip(tonemapped, 0.0, 1.0, out=tonemapped)
+
+    if intensity == 1.0:
+        return tonemapped.astype(np.float32)
+
+    # Blend between standard SDR clipping and full ACES compression.
+    # Unlike blending with raw HDR, both inputs here are strictly <= 1.0, 
+    # guaranteeing the output never blows out on an SDR display.
+    sdr_clipped = np.clip(img, 0.0, 1.0)
+    
+    return cv2.addWeighted(
+        tonemapped, intensity, 
+        sdr_clipped, 1.0 - intensity, 
+        0.0
+    ).astype(np.float32)
 
 def export_photo(img_array: np.ndarray, output_path: str, preset: Dict[str, Any], max_mb: float = 8.0):
     """Applies film noise grain overlays and frames pre-cropped, processed image matrices.
