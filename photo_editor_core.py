@@ -5,17 +5,18 @@ geometric transformations, and dynamic range tonemapping using multi-threaded
 stripe segmentation algorithms.
 """
 
-import hashlib
+# import hashlib
 import argparse
 import json
 import os
 import sys
-from dataclasses import dataclass
-from scipy.interpolate import CubicSpline
+# from dataclasses import dataclass
+# from scipy.interpolate import CubicSpline
+from scipy.ndimage import map_coordinates
 
 import logging
 from typing import Dict, Any
-from concurrent.futures import ThreadPoolExecutor
+# from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
 from PIL import Image, ImageOps
@@ -273,7 +274,13 @@ class ColorStage(PipelineStage):
             if vibrance != 0.0:
                 max_rgb = np.max(out, axis=2, keepdims=True)
                 min_rgb = np.min(out, axis=2, keepdims=True)
-                sat_mask = np.where(max_rgb > 1e-5, (max_rgb - min_rgb) / max_rgb, np.float32(0.0))
+                sat_mask = np.divide(
+                        max_rgb - min_rgb, 
+                        max_rgb, 
+                        out=np.zeros_like(max_rgb, dtype=np.float32), 
+                        where=max_rgb > np.float32(1e-5)
+                    )
+                # sat_mask = np.where(max_rgb > 1e-5, (max_rgb - min_rgb) / max_rgb, np.float32(0.0))
                 vib_factor = np.float32(vibrance) * (np.float32(1.0) - sat_mask)
                 out = grayscale + (out - grayscale) * (np.float32(1.0) + vib_factor)
 
@@ -361,13 +368,80 @@ class ColorStage(PipelineStage):
         return out
 
 
-class FilmStage(PipelineStage):
+class FilmColorStage(PipelineStage):
     def __init__(self):
         # TODO: maybe break this up into further steps
         super().__init__('film', [
-            'texture', 'clarity', 'color_matrix', 'bloom_threshold', 'bloom_radius', 'bloom_strength',
+            'color_matrix', 'hdr_compression'])
+
+    def is_dirty(self, preset):
+        return self.is_dirty_nested_keys(preset)
+    
+    def _apply_sdr_preview(self, img, intensity):
+        """
+        Compresses HDR data into an SDR range (0.0 to 1.0), simulating Lightroom's 
+        'Preview for SDR Display'.
+        
+        Args:
+            img (np.ndarray): High precision source image (can contain values > 1.0).
+            intensity (float): 0.0 represents standard SDR clipping (no HDR compression).
+                               1.0 represents full ACES highlight roll-off.
+        
+        Returns:
+            np.ndarray: Bounded SDR image matrix in range [0.0, 1.0].
+        """
+        # Clamp intensity to valid range
+        intensity = float(np.clip(intensity, 0.0, 1.0))
+        
+        if intensity == 0.0:
+            # At 0 intensity, simulate standard SDR display clipping without tonemapping
+            return np.clip(img, 0.0, 1.0).astype(np.float32)
+
+        # Narkowicz ACES approximation coefficients
+        a = np.float32(2.51)
+        b = np.float32(0.03)
+        c = np.float32(2.43)
+        d = np.float32(0.59)
+        e = np.float32(0.14)
+
+        # Apply ACES curve directly without artificial exposure pre-scaling
+        tonemapped = (img * (a * img + b)) / (img * (c * img + d) + e)
+        
+        # Ensure mathematical precision errors don't drift outside [0, 1]
+        np.clip(tonemapped, 0.0, 1.0, out=tonemapped)
+
+        if intensity == 1.0:
+            return tonemapped.astype(np.float32)
+
+        # Blend between standard SDR clipping and full ACES compression.
+        # Unlike blending with raw HDR, both inputs here are strictly <= 1.0, 
+        # guaranteeing the output never blows out on an SDR display.
+        sdr_clipped = np.clip(img, 0.0, 1.0)
+        
+        return cv2.addWeighted(
+            tonemapped, intensity, 
+            sdr_clipped, 1.0 - intensity, 
+            0.0
+        ).astype(np.float32)
+    
+    def run(self, img, preset):
+        out = img.copy()
+        hdr_comp = preset.get('hdr_compression', 0.0)
+
+        if hdr_comp > 0.0:
+            out = self._apply_sdr_preview(out, hdr_comp)
+        
+        out = apply_color_matrix(out, preset)
+
+        return out
+
+
+class FilmSpatialStage(PipelineStage):
+    def __init__(self):
+        # TODO: maybe break this up into further steps
+        super().__init__('film', [
+            'texture', 'clarity', 'bloom_threshold', 'bloom_radius', 'bloom_strength',
             'halation_threshold', 'halation_radius', 'halation_strength', 'halation_offset_x', 'halation_offset_y',
-            'grain_strength', 'grain_size', 'grain_chroma',
             'vignette_strength', 'vignette_blur', 'vignette_radius', 'corner_blur_radius'
         ])
 
@@ -397,19 +471,12 @@ class FilmStage(PipelineStage):
 
 
         # Film Simulation methods
-        out = apply_color_matrix(out, preset)
         out = apply_bloom(out, preset)
         out = apply_halation(out, preset)
-        out = apply_smart_grain(out, preset)
         out = apply_vignette_and_softness(out, preset)
 
-        # Display Preparation: Tonemapping at the end of float processing
-        hdr_comp = preset.get('hdr_compression', 0.0)
-        if hdr_comp > 0.0:
-            out = apply_sdr_preview(out, hdr_comp)
-            pass
-
         return out
+
 
 # TODO: extract from "run_pipeline" the different stages to have. Keep them few, because we have to hold results in memory
 
@@ -419,11 +486,66 @@ class PipelineState:
             'wb': WBStage(),
             'values' : ValuesStage(),
             'color' : ColorStage(),
-            'film' : FilmStage()
+            'film_color' : FilmColorStage(),
+            'film_spatial' : FilmSpatialStage()
         }
-        self.order = ['wb', 'values', 'color', 'film']
+        self.order = ['wb', 'values', 'color', 'film_color', 'film_spatial']
+        # Dictionary to store cached 3D LUT arrays per stage
+        self.luts: Dict[str, np.ndarray] = {}
+        self.grid_size = 32  # 32x32x32 is the industry standard for speed/precision
+    
+    def _generate_identity_grid(self) -> np.ndarray:
+        """Creates a 3D RGB identity grid shaped as a 2D image for pipeline evaluation."""
+        x = np.linspace(0.0, 1.0, self.grid_size, dtype=np.float32)
+        r, g, b = np.meshgrid(x, x, x, indexing='ij')
+        grid_3d = np.stack([r, g, b], axis=-1)
+        
+        # Reshape (N, N, N, 3) -> (N*N, N, 3) so Stage.run() treats it like an image
+        return grid_3d.reshape(-1, self.grid_size, 3)
 
-    def process(self, stage_name, preset, input_data):
+    def _apply_3d_lut(self, img: np.ndarray, lut_3d: np.ndarray) -> np.ndarray:
+        """Applies a 3D LUT volume to an image using trilinear interpolation."""
+        h, w, c = img.shape
+        
+        # 1. Map color values to coordinates in the range [0, grid_size - 1]
+        # NOTE: If using an HDR shaper curve, apply domain compression here before clipping
+        coords = np.clip(img, 0.0, 1.0) * (self.grid_size - 1)
+        
+        # 2. Reshape to (3, H*W) as required by scipy.ndimage.map_coordinates
+        flat_coords = coords.reshape(-1, 3).T
+        
+        out = np.empty_like(img)
+        for ch in range(3):
+            # Evaluate trilinear interpolation per channel
+            sampled = map_coordinates(
+                lut_3d[:, :, :, ch], 
+                flat_coords, 
+                order=1,       # 1 = linear (trilinear in 3D)
+                mode='nearest',
+                prefilter=False # Vital for performance; disables spline pre-filtering
+            )
+            out[:, :, ch] = sampled.reshape(h, w)
+            
+        return out
+
+    def process_with_lut(self, stage_name: str, preset: Dict[str, Any], img: np.ndarray) -> np.ndarray:
+        """Checks dirty state, updates the cached 3D LUT if needed, and applies it."""
+        stage = self.stages[stage_name]
+        
+        # If parameters changed or LUT isn't generated yet, compute the new LUT
+        if stage.is_dirty(preset) or stage_name not in self.luts:
+            dummy_raster = self._generate_identity_grid()
+            processed_raster = stage.run(dummy_raster, preset)
+            
+            # Reshape back to 3D volume (N, N, N, 3) and cache
+            self.luts[stage_name] = processed_raster.reshape(
+                self.grid_size, self.grid_size, self.grid_size, 3
+            )
+            
+        # Apply the cached LUT volume to the actual image tile
+        return self._apply_3d_lut(img, self.luts[stage_name])
+    
+    def process(self, stage_name: str, preset: Dict[str, Any], img: np.ndarray) -> np.ndarray:
         stage = self.stages[stage_name]
         
         # A stage is dirty if:
@@ -934,7 +1056,7 @@ class PhotoEditor:
         np.clip(img, 0.0, 1.0, out=img)
         return img
 
-    def run_parallel_pipeline(self, src_matrix: np.ndarray, preset: Dict[str, Any], pipeline_state : PipelineState, fast_preview : bool = False) -> np.ndarray:
+    def run_parallel_pipeline(self, src_matrix: np.ndarray, preset: Dict[str, Any], pipeline_state : PipelineState, fast_preview : bool = False, apply_film_spatial_effects : bool=True) -> np.ndarray:
         """Scales pre-cropped image matrices to match compression dimensions, then processes tiles concurrently.
 
         Args:
@@ -970,13 +1092,38 @@ class PhotoEditor:
             if pct < 1.0:
                 src_matrix = cv2.resize(src_matrix, (int(w * pct), int(h * pct)), interpolation=cv2.INTER_LANCZOS4)
         
-        h, w, c = src_matrix.shape
-        wb_img = state.process('wb', preset, src_matrix)
-        values_img = state.process('values', preset, wb_img)
-        color_img = state.process('color', preset, values_img)
-        film_img = state.process('film', preset, color_img)
-        np.clip(film_img, 0.0, 1.0, out=film_img)
-        return film_img
+        if fast_preview:
+            # 1. Use LUTs for point-wise color operations
+            grid = state._generate_identity_grid()
+            # We can combine wb val and color stages all into one master lut
+            wb_grid = state.stages['wb'].run(grid, preset)
+            val_grid = state.stages['values'].run(wb_grid, preset)
+            color_grid = state.stages['color'].run(val_grid, preset)
+            master_lut = state.stages['film_color'].run(color_grid, preset).reshape(32, 32, 32, 3)
+            film_color_img = state._apply_3d_lut(src_matrix, master_lut)
+            np.clip(film_color_img, 0.0, 1.0, out=film_color_img)
+            return film_color_img
+
+            # if apply_film_spatial_effects:
+            #     pass
+            #     film_spatial_effects_img = state.stages['film_spatial'].run(film_color_img, preset)
+            #     np.clip(film_spatial_effects_img, 0.0, 1.0, out=film_spatial_effects_img)
+            #     return film_spatial_effects_img
+            # else:
+            #     np.clip(film_color_img, 0.0, 1.0, out=film_color_img)
+            #     return film_color_img
+        else:
+            # 1. Full precision raster execution for final/static render
+            wb_img = state.stages['wb'].run(src_matrix, preset)
+            values_img = state.stages['values'].run(wb_img, preset)
+            color_img = state.stages['color'].run(values_img, preset)
+            
+            # 2. Run full spatial + color FilmStage directly on the raster
+            film_img = state.stages['film'].run(color_img, preset)
+            # TODO: apply grain
+
+            np.clip(film_img, 0.0, 1.0, out=film_img)
+            return film_img
 
         # if fast_preview:
         #     np.clip(color_img, 0.0, 1.0, out=color_img)
@@ -1012,6 +1159,8 @@ class PhotoEditor:
         #     executor.map(process_stripe, range(cores))
 
         # return output_matrix
+
+    
 
     @staticmethod
     def apply_crop(img: np.ndarray, crop_data: Dict[str, Any]) -> np.ndarray:

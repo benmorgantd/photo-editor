@@ -2346,7 +2346,7 @@ class MainWindow(QMainWindow):
             #         self.crop_data_cache['cropped_preview_matrix'] = cropped_preview.copy()
             cropped_preview = PhotoEditor.apply_crop(source_matrix, self.active_crop_data)
 
-            render_array = self.photo_editor_instance.run_parallel_pipeline(cropped_preview, self.preset, pipeline_state, fast_preview=self.is_scrubbing)  # This takes 4 seconds
+            render_array = self.photo_editor_instance.run_parallel_pipeline(cropped_preview, self.preset, pipeline_state, fast_preview=True, apply_film_spatial_effects=self.is_scrubbing)  # This takes 4 seconds
 
         # Trigger histogram asynchronously or on downsampled data to prevent UI blocks
         self.histogram_widget.render_histogram(render_array)
