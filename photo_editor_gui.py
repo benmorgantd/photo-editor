@@ -132,7 +132,7 @@ class ExportWorker(QThread):
 
                 self.progress_signal.emit(f"[{idx+1}/{total_files}] Computing multi-core tile pixel transformations...")
                 photo_editor = PhotoEditor(img_path)
-                processed_full = photo_editor.run_parallel_pipeline(cropped_full, item_preset, None)
+                processed_full, pipeline_state = photo_editor.run_parallel_pipeline(cropped_full, item_preset, None)
 
                 if self._is_cancelled:
                     break
@@ -171,7 +171,7 @@ class FullResLoaderWorker(QRunnable):
     def run(self):
         try:
             # This heavy I/O and matrix decoding now runs off the main event loop
-            matrix = PhotoEditor.load_image_matrix(self.file_path, preview=True, max_width=720)
+            matrix = PhotoEditor.load_image_matrix(self.file_path, preview=True, max_width=1080)
             self.signals.finished.emit(self.file_path, matrix)
         except Exception as e:
             err_msg = f"{e}\n{traceback.format_exc()}"
@@ -1662,13 +1662,13 @@ class MainWindow(QMainWindow):
         g_freq = CollapsibleGroupBox("Local Frequency Adjustments")
         self.sliders_map["texture"] = self._create_slider_row(g_freq.content_layout, "Texture Definition", -100, 100, 0, lambda v: self._update_preset_key("texture", v / 100.0))
         self.sliders_map["clarity"] = self._create_slider_row(g_freq.content_layout, "Clarity Profile", -100, 100, 0, lambda v: self._update_preset_key("clarity", v / 100.0))
-        self.sliders_map["gaussian_blur"] = self._create_slider_row(g_freq.content_layout, "Gaussian Spatial Blur Pass", 0, 50, 0, lambda v: self._update_preset_key("gaussian_blur", v / 10.0))
+        # self.sliders_map["gaussian_blur"] = self._create_slider_row(g_freq.content_layout, "Gaussian Spatial Blur Pass", 0, 50, 0, lambda v: self._update_preset_key("gaussian_blur", v / 10.0))
         self.sliders_layout.addWidget(g_freq)
 
-        g_style = CollapsibleGroupBox("Basic Grain")
-        self.sliders_map["grain"] = self._create_slider_row(g_style.content_layout, "Grain Density Strength", 0, 100, 0, lambda v: self._update_preset_key("grain", v / 100.0))
-        self.sliders_map["grain_size"] = self._create_slider_row(g_style.content_layout, "Grain Cluster Size Scale", 1, 50, 10, lambda v: self._update_preset_key("grain_size", v / 10.0))
-        self.sliders_layout.addWidget(g_style)
+        # g_style = CollapsibleGroupBox("Basic Grain")
+        # self.sliders_map["grain"] = self._create_slider_row(g_style.content_layout, "Grain Density Strength", 0, 100, 0, lambda v: self._update_preset_key("grain", v / 100.0))
+        # self.sliders_map["grain_size"] = self._create_slider_row(g_style.content_layout, "Grain Cluster Size Scale", 1, 50, 10, lambda v: self._update_preset_key("grain_size", v / 10.0))
+        # self.sliders_layout.addWidget(g_style)
 
         g_film_sim = CollapsibleGroupBox('Film Simulation')
         # ==========================================
@@ -1995,7 +1995,7 @@ class MainWindow(QMainWindow):
 
         self.sliders_map["texture"].setValue(int(self.preset.get("texture", 0.0) * 100))
         self.sliders_map["clarity"].setValue(int(self.preset.get("clarity", 0.0) * 100))
-        self.sliders_map["gaussian_blur"].setValue(int(self.preset.get("gaussian_blur", 0.0) * 10))
+        # self.sliders_map["gaussian_blur"].setValue(int(self.preset.get("gaussian_blur", 0.0) * 10))
         self.sliders_map["vibrance"].setValue(int(self.preset.get("vibrance", 0.0) * 100))
         self.sliders_map["saturation"].setValue(int(self.preset.get("saturation", 0.0) * 100))
 
@@ -2014,8 +2014,10 @@ class MainWindow(QMainWindow):
             self.sliders_map[f"{band}_hue"].setValue(int(band_data.get("hue", 0.0) * 100))
             self.sliders_map[f"{band}_sat"].setValue(int(band_data.get("sat", 0.0) * 100))
 
-        self.sliders_map["grain"].setValue(int(self.preset.get("grain", 0.0) * 100))
-        self.sliders_map["grain_size"].setValue(int(self.preset.get("grain_size", 1.0) * 10))
+        # self.sliders_map["grain"].setValue(int(self.preset.get("grain", 0.0) * 100))
+        # self.sliders_map["grain_size"].setValue(int(self.preset.get("grain_size", 1.0) * 10))
+
+        # TODO: load all film presets to ui
 
         self.is_updating_ui = False
 
@@ -2252,11 +2254,9 @@ class MainWindow(QMainWindow):
             # 4. Dispatch the background task for the full-resolution matrix
             stored_preview_matrix = self.image_matrix_cache.get(self.current_file_path, dict()).get('preview_matrix')
             if stored_preview_matrix is not None:
-                print('using stored preview matrix')
                 self.preview_matrix = stored_preview_matrix.copy()
                 self._on_fullres_load_complete(self.current_file_path, self.preview_matrix)
             else:
-                print('starting fullres background load of preview matrix')
                 self._start_background_fullres_load(path)
 
             # TODO: start a thread loading the proxy matrices for the surrounding 10 files in the tree
@@ -2346,7 +2346,11 @@ class MainWindow(QMainWindow):
             #         self.crop_data_cache['cropped_preview_matrix'] = cropped_preview.copy()
             cropped_preview = PhotoEditor.apply_crop(source_matrix, self.active_crop_data)
 
-            render_array = self.photo_editor_instance.run_parallel_pipeline(cropped_preview, self.preset, pipeline_state, fast_preview=True, apply_film_spatial_effects=self.is_scrubbing)  # This takes 4 seconds
+            render_array, edited_pipeline_state = self.photo_editor_instance.run_parallel_pipeline(cropped_preview, self.preset, pipeline_state, fast_preview=True, apply_film_spatial_effects=not self.is_scrubbing)  # This takes 4 seconds
+            if self.is_scrubbing:
+                self.pipeline_state_cache['proxy_pipeline_state'] = edited_pipeline_state
+            else:
+                self.pipeline_state_cache['preview_pipeline_state'] = edited_pipeline_state
 
         # Trigger histogram asynchronously or on downsampled data to prevent UI blocks
         self.histogram_widget.render_histogram(render_array)

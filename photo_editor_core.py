@@ -12,7 +12,9 @@ import os
 import sys
 # from dataclasses import dataclass
 # from scipy.interpolate import CubicSpline
-from scipy.ndimage import map_coordinates
+# from scipy.ndimage import map_coordinates
+import time
+from numba import njit, prange
 
 import logging
 from typing import Dict, Any
@@ -442,7 +444,7 @@ class FilmSpatialStage(PipelineStage):
         super().__init__('film', [
             'texture', 'clarity', 'bloom_threshold', 'bloom_radius', 'bloom_strength',
             'halation_threshold', 'halation_radius', 'halation_strength', 'halation_offset_x', 'halation_offset_y',
-            'vignette_strength', 'vignette_blur', 'vignette_radius', 'corner_blur_radius'
+            'vignette_strength', 'vignette_blur', 'vignette_radius', 'corner_blur_radius',
         ])
 
     def is_dirty(self, preset):
@@ -478,6 +480,69 @@ class FilmSpatialStage(PipelineStage):
         return out
 
 
+class GrainStage(PipelineStage):
+    def __init__(self):
+        super().__init__('grain', ['enable_grain', 'grain_strength', 'grain_size', 'grain_chroma'])
+        self.grain_cache = None
+
+    def is_dirty(self, preset):
+        # TODO: if the image size changes does the grain cache have to be updated
+        return super().is_dirty(preset)
+
+    def run(self, img, preset):
+        start = time.time()
+        if not preset.get("enable_grain", False) or preset.get("grain_strength", 0.0) <= 0:
+            return img
+        
+        out = img.copy()
+        
+        strength = preset.get("grain_strength", 0.05)
+        size = max(0.5, preset.get("grain_size", 1.0))
+        chroma_weight = np.clip(preset.get("grain_chroma", 0.1), 0.0, 1.0)
+        
+        h, w = out.shape[:2]
+
+        if self.grain_cache is not None and self.grain_cache.shape[:2] == (h, w):
+            # 5. Apply grain via linear addition modulated by the luma mask
+            lstart = time.time()
+            lum = get_luminance(out)[..., np.newaxis]  # I guess we have to get luminance each time
+            print(f'time to get luminance: {time.time() - lstart}')
+            luma_mask = 4.0 * lum * (1.0 - lum)
+            grain_layer = self.grain_cache * strength * luma_mask
+            logger.info(f'Re-using grain cache info. Time given reuse: {time.time() - start}')
+            return np.clip(out + grain_layer, 0.0, 1.0)
+            
+        # 1. Calculate dimensions for grain crystal scaling
+        gh, gw = int(h / size), int(w / size)
+        
+        # 2. Generate luma and chroma noise textures
+        luma_noise = np.random.normal(0.0, 1.0, (gh, gw)).astype(np.float32)
+        
+        if chroma_weight > 0:
+            chroma_noise = np.random.normal(0.0, 1.0, (gh, gw, 3)).astype(np.float32)
+            # Combine mono and color noise based on chroma weight
+            noise = (chroma_noise * chroma_weight) + (luma_noise[..., np.newaxis] * (1.0 - chroma_weight))
+        else:
+            noise = luma_noise[..., np.newaxis]
+            
+        # 3. Scale noise up to image resolution using bicubic interpolation for organic softness
+        if size != 1.0:
+            noise = cv2.resize(noise, (w, h), interpolation=cv2.INTER_CUBIC)
+            if noise.ndim == 2:
+                noise = noise[..., np.newaxis]
+                
+        # 4. Parabolic luminance mask: peak grain at 50% gray (0.5), zero at 0.0 and 1.0
+        lum = get_luminance(out)[..., np.newaxis]
+        luma_mask = 4.0 * lum * (1.0 - lum)
+
+        # Store the grain in a cache
+        self.grain_cache = noise
+        
+        # 5. Apply grain via linear addition modulated by the luma mask
+        grain_layer = noise * strength * luma_mask
+
+        return np.clip(out + grain_layer, 0.0, 1.0)
+
 # TODO: extract from "run_pipeline" the different stages to have. Keep them few, because we have to hold results in memory
 
 class PipelineState:
@@ -487,49 +552,129 @@ class PipelineState:
             'values' : ValuesStage(),
             'color' : ColorStage(),
             'film_color' : FilmColorStage(),
-            'film_spatial' : FilmSpatialStage()
+            'film_spatial' : FilmSpatialStage(),
+            'grain' : GrainStage()
         }
-        self.order = ['wb', 'values', 'color', 'film_color', 'film_spatial']
+        self.order = ['wb', 'values', 'color', 'film_color', 'film_spatial', 'grain']
         # Dictionary to store cached 3D LUT arrays per stage
         self.luts: Dict[str, np.ndarray] = {}
         self.grid_size = 32  # 32x32x32 is the industry standard for speed/precision
     
     def _generate_identity_grid(self) -> np.ndarray:
         """Creates a 3D RGB identity grid shaped as a 2D image for pipeline evaluation."""
+        start = time.time()
         x = np.linspace(0.0, 1.0, self.grid_size, dtype=np.float32)
         r, g, b = np.meshgrid(x, x, x, indexing='ij')
         grid_3d = np.stack([r, g, b], axis=-1)
+
+        print(f'generate identity grid: {time.time() - start}')
         
         # Reshape (N, N, N, 3) -> (N*N, N, 3) so Stage.run() treats it like an image
         return grid_3d.reshape(-1, self.grid_size, 3)
+    
+    @staticmethod
+    @njit(parallel=True, fastmath=True)
+    def _trilinear_interp_numba(img: np.ndarray, lut_3d: np.ndarray, grid_size: int) -> np.ndarray:
+        h, w, _ = img.shape
+        out = np.empty_like(img)
+        max_idx = float(grid_size - 1)
+        
+        for i in prange(h):
+            for j in range(w):
+                # 1. Map values to grid coordinates and clip to bounds
+                r = img[i, j, 0] * max_idx
+                g = img[i, j, 1] * max_idx
+                b = img[i, j, 2] * max_idx
+                
+                if r < 0.0: r = 0.0
+                elif r > max_idx: r = max_idx
+                if g < 0.0: g = 0.0
+                elif g > max_idx: g = max_idx
+                if b < 0.0: b = 0.0
+                elif b > max_idx: b = max_idx
+                
+                # 2. Get integer bounding indices
+                r0 = int(r)
+                g0 = int(g)
+                b0 = int(b)
+                
+                r1 = min(r0 + 1, grid_size - 1)
+                g1 = min(g0 + 1, grid_size - 1)
+                b1 = min(b0 + 1, grid_size - 1)
+                
+                # 3. Calculate interpolation weights
+                dr = r - r0
+                dg = g - g0
+                db = b - b0
+                
+                # 4. Fetch 8 corners and interpolate across all 3 color channels at once
+                for ch in range(3):
+                    c000 = lut_3d[r0, g0, b0, ch]
+                    c100 = lut_3d[r1, g0, b0, ch]
+                    c010 = lut_3d[r0, g1, b0, ch]
+                    c110 = lut_3d[r1, g1, b0, ch]
+                    c001 = lut_3d[r0, g0, b1, ch]
+                    c101 = lut_3d[r1, g0, b1, ch]
+                    c011 = lut_3d[r0, g1, b1, ch]
+                    c111 = lut_3d[r1, g1, b1, ch]
+                    
+                    # Lerp along R axis
+                    c00 = c000 + dr * (c100 - c000)
+                    c10 = c010 + dr * (c110 - c010)
+                    c01 = c001 + dr * (c101 - c001)
+                    c11 = c011 + dr * (c111 - c011)
+                    
+                    # Lerp along G axis
+                    c0 = c00 + dg * (c10 - c00)
+                    c1 = c01 + dg * (c11 - c01)
+                    
+                    # Lerp along B axis
+                    out[i, j, ch] = c0 + db * (c1 - c0)
+                    
+        return out
 
     def _apply_3d_lut(self, img: np.ndarray, lut_3d: np.ndarray) -> np.ndarray:
-        """Applies a 3D LUT volume to an image using trilinear interpolation."""
-        h, w, c = img.shape
-        
-        # 1. Map color values to coordinates in the range [0, grid_size - 1]
-        # NOTE: If using an HDR shaper curve, apply domain compression here before clipping
-        coords = np.clip(img, 0.0, 1.0) * (self.grid_size - 1)
-        
-        # 2. Reshape to (3, H*W) as required by scipy.ndimage.map_coordinates
-        flat_coords = coords.reshape(-1, 3).T
-        
-        out = np.empty_like(img)
-        for ch in range(3):
-            # Evaluate trilinear interpolation per channel
-            sampled = map_coordinates(
-                lut_3d[:, :, :, ch], 
-                flat_coords, 
-                order=1,       # 1 = linear (trilinear in 3D)
-                mode='nearest',
-                prefilter=False # Vital for performance; disables spline pre-filtering
-            )
-            out[:, :, ch] = sampled.reshape(h, w)
-            
+        """Applies a 3D LUT volume using parallelized Numba JIT compilation."""
+        start = time.time()
+        out = self._trilinear_interp_numba(img, lut_3d, self.grid_size)
+        print(f'apply 3d lut (numba): {time.time() - start}')
         return out
 
     def process_with_lut(self, stage_name: str, preset: Dict[str, Any], img: np.ndarray) -> np.ndarray:
+        """Checks dirty state, updates the cached 3D LUT if needed, and applies it with image caching."""
+        start = time.time()
+        stage = self.stages[stage_name]
+        
+        # Check if we need to re-evaluate the image for this stage:
+        # 1. Preset settings for this stage changed
+        # 2. Upstream stage changed (stage.data was wiped to None via cascade)
+        if stage.is_dirty(preset) or stage.data is None:
+            # Trigger cascading invalidation for everything AFTER this stage
+            # (Must do this whenever we are going to generate a new output image)
+            idx = self.order.index(stage_name)
+            for subsequent in self.order[idx+1:]:
+                if subsequent in self.stages:
+                    self.stages[subsequent].data = None
+            
+            # TIER 1: Check if the LUT volume itself needs to be regenerated.
+            # LUTs only depend on the preset math, NOT on incoming image data.
+            if stage.is_dirty(preset) or stage_name not in self.luts:
+                dummy_raster = self._generate_identity_grid()
+                processed_raster = stage.run(dummy_raster, preset)
+                
+                # Reshape back to 3D volume (N, N, N, 3) and cache
+                self.luts[stage_name] = processed_raster.reshape(
+                    self.grid_size, self.grid_size, self.grid_size, 3
+                )
+            
+            # TIER 2: Apply the LUT to the image and cache the resulting array
+            stage.data = self._apply_3d_lut(img, self.luts[stage_name])
+            
+        return stage.data
+
+    def _process_with_lut(self, stage_name: str, preset: Dict[str, Any], img: np.ndarray) -> np.ndarray:
         """Checks dirty state, updates the cached 3D LUT if needed, and applies it."""
+        start = time.time()
         stage = self.stages[stage_name]
         
         # If parameters changed or LUT isn't generated yet, compute the new LUT
@@ -541,8 +686,10 @@ class PipelineState:
             self.luts[stage_name] = processed_raster.reshape(
                 self.grid_size, self.grid_size, self.grid_size, 3
             )
-            
+        
+        print(f'process with lut {time.time() - start}')
         # Apply the cached LUT volume to the actual image tile
+        # TODO: we aren't using stage.data to save processing time here! We could be.
         return self._apply_3d_lut(img, self.luts[stage_name])
     
     def process(self, stage_name: str, preset: Dict[str, Any], img: np.ndarray) -> np.ndarray:
@@ -559,7 +706,7 @@ class PipelineState:
                     self.stages[subsequent].data = None
             
             # print(f'Processing stage {stage.name}')
-            stage.data = stage.run(input_data, preset)
+            stage.data = stage.run(img, preset)
 
         return stage.data
 
@@ -578,7 +725,7 @@ class PhotoEditor:
             "hdr_compression": 0.0, "exposure": 0.0, "contrast": 0.0,
             "whites": 0.0, "blacks": 0.0,
             "highlights": 0.0, "shadows": 0.0, "texture": 0.0, "clarity": 0.0,
-            "gaussian_blur": 0.0, "vibrance": 0.0, "saturation": 0.0, "grain": 0.0, "grain_size": 1.0,
+            "vibrance": 0.0, "saturation": 0.0, "grain": 0.0, "grain_size": 1.0,
             "temp_kelvin": 6500, "tint": 0.0,
             "color_adjustments": {
                 "red": {"hue": 0.0, "sat": 0.0}, "orange": {"hue": 0.0, "sat": 0.0},
@@ -632,7 +779,7 @@ class PhotoEditor:
             # 4. Smart Grain
             "enable_grain": True,
             "grain_strength": 0.05, 
-            "grain_size": 0.08,      # >1.0 scales grain up for coarse emulsion
+            "grain_size": 0.5,      # >1.0 scales grain up for coarse emulsion
             "grain_chroma": 0.15,   # 0.0 = B&W grain, 1.0 = color grain
             
             # 5. Vignette & Optical Softness
@@ -1092,6 +1239,7 @@ class PhotoEditor:
             if pct < 1.0:
                 src_matrix = cv2.resize(src_matrix, (int(w * pct), int(h * pct)), interpolation=cv2.INTER_LANCZOS4)
         
+        # TODO: re-implement multi-core rendering?
         if fast_preview:
             # 1. Use LUTs for point-wise color operations
             grid = state._generate_identity_grid()
@@ -1101,29 +1249,26 @@ class PhotoEditor:
             color_grid = state.stages['color'].run(val_grid, preset)
             master_lut = state.stages['film_color'].run(color_grid, preset).reshape(32, 32, 32, 3)
             film_color_img = state._apply_3d_lut(src_matrix, master_lut)
-            np.clip(film_color_img, 0.0, 1.0, out=film_color_img)
-            return film_color_img
 
-            # if apply_film_spatial_effects:
-            #     pass
-            #     film_spatial_effects_img = state.stages['film_spatial'].run(film_color_img, preset)
-            #     np.clip(film_spatial_effects_img, 0.0, 1.0, out=film_spatial_effects_img)
-            #     return film_spatial_effects_img
-            # else:
-            #     np.clip(film_color_img, 0.0, 1.0, out=film_color_img)
-            #     return film_color_img
+            if apply_film_spatial_effects:
+                # Only apply grain and film spatial effects if not scrubbing
+                film_spatial_img = state.stages['film_spatial'].run(film_color_img, preset)
+                grain_img = state.stages['grain'].run(film_spatial_img, preset)
+                np.clip(grain_img, 0.0, 1.0, out=grain_img)
+                return grain_img, state
+            else:
+                np.clip(film_color_img, 0.0, 1.0, out=film_color_img)
+                return film_color_img, state  # This is very fast and interactive, returning here
         else:
             # 1. Full precision raster execution for final/static render
             wb_img = state.stages['wb'].run(src_matrix, preset)
             values_img = state.stages['values'].run(wb_img, preset)
             color_img = state.stages['color'].run(values_img, preset)
-            
-            # 2. Run full spatial + color FilmStage directly on the raster
-            film_img = state.stages['film'].run(color_img, preset)
-            # TODO: apply grain
-
-            np.clip(film_img, 0.0, 1.0, out=film_img)
-            return film_img
+            film_color_img = state.stages['film_color'].run(color_img, preset)
+            film_spatial_img = state.stages['film_spatial'].run(film_color_img, preset)
+            grain_img = apply_smart_grain(film_spatial_img, preset)
+            np.clip(grain_img, 0.0, 1.0, out=grain_img)
+            return grain_img, pipeline_state
 
         # if fast_preview:
         #     np.clip(color_img, 0.0, 1.0, out=color_img)
