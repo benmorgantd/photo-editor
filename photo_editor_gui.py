@@ -171,7 +171,7 @@ class FullResLoaderWorker(QRunnable):
     def run(self):
         try:
             # This heavy I/O and matrix decoding now runs off the main event loop
-            matrix = PhotoEditor.load_image_matrix(self.file_path, preview=True, max_width=1080)
+            matrix = PhotoEditor.load_image_matrix(self.file_path, preview=True, max_width=2048)
             self.signals.finished.emit(self.file_path, matrix)
         except Exception as e:
             err_msg = f"{e}\n{traceback.format_exc()}"

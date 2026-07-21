@@ -157,24 +157,90 @@ class PipelineStage:
 
 class WBStage(PipelineStage):
     def __init__(self):
-        super().__init__('wb', ['temp_kelvin', 'tint', 'apply_temperature_adjustment'])
+        super().__init__('wb', ['temp_kelvin', 'tint', 'apply_temperature_adjustment', 'color_matrix', 'hdr_compression'])
+    
+    def is_dirty(self, preset):
+        return self.is_dirty_nested_keys(preset)
+    
+    def _apply_sdr_preview(self, img, intensity):
+        """
+        Compresses HDR data into an SDR range (0.0 to 1.0), simulating Lightroom's 
+        'Preview for SDR Display'.
+        
+        Args:
+            img (np.ndarray): High precision source image (can contain values > 1.0).
+            intensity (float): 0.0 represents standard SDR clipping (no HDR compression).
+                               1.0 represents full ACES highlight roll-off.
+        
+        Returns:
+            np.ndarray: Bounded SDR image matrix in range [0.0, 1.0].
+        """
+        # Clamp intensity to valid range
+        intensity = float(np.clip(intensity, 0.0, 1.0))
+        
+        if intensity == 0.0:
+            # At 0 intensity, simulate standard SDR display clipping without tonemapping
+            return np.clip(img, 0.0, 1.0).astype(np.float32)
+
+        # Narkowicz ACES approximation coefficients
+        a = np.float32(2.51)
+        b = np.float32(0.03)
+        c = np.float32(2.43)
+        d = np.float32(0.59)
+        e = np.float32(0.14)
+
+        # Apply ACES curve directly without artificial exposure pre-scaling
+        tonemapped = (img * (a * img + b)) / (img * (c * img + d) + e)
+        
+        # Ensure mathematical precision errors don't drift outside [0, 1]
+        np.clip(tonemapped, 0.0, 1.0, out=tonemapped)
+
+        if intensity == 1.0:
+            return tonemapped.astype(np.float32)
+
+        # Blend between standard SDR clipping and full ACES compression.
+        # Unlike blending with raw HDR, both inputs here are strictly <= 1.0, 
+        # guaranteeing the output never blows out on an SDR display.
+        sdr_clipped = np.clip(img, 0.0, 1.0)
+        
+        return cv2.addWeighted(
+            tonemapped, intensity, 
+            sdr_clipped, 1.0 - intensity, 
+            0.0
+        ).astype(np.float32)
     
     def run(self, img, preset):
         out = img.copy()
-        temp_kelvin = preset['temp_kelvin']
-        tint = preset['tint']
-
-        if temp_kelvin > 6500.0:
-            temp_factor = min(temp_kelvin - 6500.0, 5500.0) / 5500.0
-            out[:, :, 0] *= np.float32(1.0 + temp_factor * 0.25)
-            out[:, :, 2] *= np.float32(1.0 - temp_factor * 0.20)
+        # Ensure stable bounds
+        temp_kelvin = np.clip(preset['temp_kelvin'], 2000.0, 12000.0)
+        
+        # Calculate factor: 0.0 at 6500K, positive for Warm, negative for Cool
+        if temp_kelvin >= 6500.0:
+            # Warming: Higher Kelvin -> Boost Red, Cut Blue
+            factor = (temp_kelvin - 6500.0) / 5500.0
+            r_mult = 1.0 + (factor * 0.25)
+            b_mult = 1.0 - (factor * 0.20)
         else:
-            temp_factor = max(6500.0 - temp_kelvin, 4500.0) / 4500.0
-            out[:, :, 2] *= np.float32(1.0 + temp_factor * 0.30)
-            out[:, :, 0] *= np.float32(1.0 - temp_factor * 0.15)
+            # Cooling: Lower Kelvin -> Cut Red, Boost Blue
+            factor = (6500.0 - temp_kelvin) / 4500.0
+            r_mult = 1.0 - (factor * 0.15)
+            b_mult = 1.0 + (factor * 0.30)
 
-        if tint != 0.0:
-            out[:, :, 1] *= np.float32(1.0 + tint * 0.15)
+        # Apply to RGB array (Channel 0=Red, 1=Green, 2=Blue)
+        out[:, :, 0] *= np.float32(r_mult) # Red
+        out[:, :, 2] *= np.float32(b_mult) # Blue
+
+        # Tint adjustment: Positive is Green (Channel 1)
+        if preset.get('tint', 0.0) != 0.0:
+            tint_mult = 1.0 + (preset['tint'] * 0.15)
+            out[:, :, 1] *= np.float32(tint_mult)
+        
+        out = apply_color_matrix(out, preset)
+
+        hdr_comp = preset.get('hdr_compression', 0.0)
+
+        if hdr_comp > 0.0:
+            out = self._apply_sdr_preview(out, hdr_comp)
         
         return out
 
@@ -551,11 +617,11 @@ class PipelineState:
             'wb': WBStage(),
             'values' : ValuesStage(),
             'color' : ColorStage(),
-            'film_color' : FilmColorStage(),
+            # 'film_color' : FilmColorStage(),
             'film_spatial' : FilmSpatialStage(),
             'grain' : GrainStage()
         }
-        self.order = ['wb', 'values', 'color', 'film_color', 'film_spatial', 'grain']
+        self.order = ['wb', 'values', 'color', 'film_spatial', 'grain']
         # Dictionary to store cached 3D LUT arrays per stage
         self.luts: Dict[str, np.ndarray] = {}
         self.grid_size = 32  # 32x32x32 is the industry standard for speed/precision
@@ -1246,19 +1312,19 @@ class PhotoEditor:
             # We can combine wb val and color stages all into one master lut
             wb_grid = state.stages['wb'].run(grid, preset)
             val_grid = state.stages['values'].run(wb_grid, preset)
-            color_grid = state.stages['color'].run(val_grid, preset)
-            master_lut = state.stages['film_color'].run(color_grid, preset).reshape(32, 32, 32, 3)
-            film_color_img = state._apply_3d_lut(src_matrix, master_lut)
+            master_lut = state.stages['color'].run(val_grid, preset).reshape(32, 32, 32, 3)
+            # master_lut = state.stages['film_color'].run(color_grid, preset).reshape(32, 32, 32, 3)
+            color_img = state._apply_3d_lut(src_matrix, master_lut)
 
             if apply_film_spatial_effects:
                 # Only apply grain and film spatial effects if not scrubbing
-                film_spatial_img = state.stages['film_spatial'].run(film_color_img, preset)
+                film_spatial_img = state.stages['film_spatial'].run(color_img, preset)
                 grain_img = state.stages['grain'].run(film_spatial_img, preset)
                 np.clip(grain_img, 0.0, 1.0, out=grain_img)
                 return grain_img, state
             else:
-                np.clip(film_color_img, 0.0, 1.0, out=film_color_img)
-                return film_color_img, state  # This is very fast and interactive, returning here
+                np.clip(color_img, 0.0, 1.0, out=color_img)
+                return color_img, state  # This is very fast and interactive, returning here
         else:
             # 1. Full precision raster execution for final/static render
             wb_img = state.stages['wb'].run(src_matrix, preset)
