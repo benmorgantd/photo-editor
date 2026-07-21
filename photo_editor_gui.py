@@ -1369,7 +1369,7 @@ class MainWindow(QMainWindow):
         """Toggles between a state where the center file loads or not"""
         logger.info(f"Toggling Browse Mode to {int(not self.is_in_browse_mode)}")
         self.is_in_browse_mode = not self.is_in_browse_mode
-        self._refresh_viewport()
+        self._on_tree_selection_changed(self.file_model.index(), None)
     
     def _toggle_export_variants(self):
         """Toggles if all variants of the photo will be exported"""
