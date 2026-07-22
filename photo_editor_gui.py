@@ -1157,19 +1157,6 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-        # if os.path.exists(self.manifest_json_folder):
-        #     try:
-        #         # TODO: now that we don't have the full path of the edited file stored, we have to edit this
-        #         # We can store the filepath in the json data, but then we'd have to open each
-        #         for file_path in os.listdir(self.manifest_json_folder):
-        #         with open(self.manifest_json_path, "r", encoding="utf-8") as f:
-        #             data = json.load(f)
-        #             for recorded_path in data.keys():
-        #                 if os.path.exists(recorded_path):
-        #                     self.edited_files.add(recorded_path)
-        #     except Exception:
-        #         pass
-
     def _save_file_status_registry(self):
         """Serializes current priority list indices directly out to local disk paths."""
         try:
@@ -1653,8 +1640,9 @@ class MainWindow(QMainWindow):
         for band in active_color_bands:
             g_band = QGroupBox(f"Band Channel: {band.upper()}")
             vbox_b = QVBoxLayout(g_band)
-            self.sliders_map[f"{band}_hue"] = self._create_slider_row(vbox_b, "Hue Shift Orientation", -100, 100, 0, lambda val, b=band: self._update_nested_color_preset(b, "hue", val / 100.0))
-            self.sliders_map[f"{band}_sat"] = self._create_slider_row(vbox_b, "Saturation Intensity", -100, 100, 0, lambda val, b=band: self._update_nested_color_preset(b, "sat", val / 100.0))
+            self.sliders_map[f"{band}_hue"] = self._create_slider_row(vbox_b, "Hue Shift", -100, 100, 0, lambda val, b=band: self._update_nested_color_preset(b, "hue", val / 100.0))
+            self.sliders_map[f"{band}_sat"] = self._create_slider_row(vbox_b, "Saturation Shift", -100, 100, 0, lambda val, b=band: self._update_nested_color_preset(b, "sat", val / 100.0))
+            self.sliders_map[f"{band}_lightness"] = self._create_slider_row(vbox_b, "Lightness Shift", -100, 100, 0, lambda val, b=band: self._update_nested_color_preset(b, "lightness", val / 100.0))
             g_ca.content_layout.addWidget(g_band)
         self.sliders_layout.addWidget(g_ca)
 
@@ -2013,11 +2001,34 @@ class MainWindow(QMainWindow):
             band_data = color_adj.get(band, {"hue": 0.0, "sat": 0.0})
             self.sliders_map[f"{band}_hue"].setValue(int(band_data.get("hue", 0.0) * 100))
             self.sliders_map[f"{band}_sat"].setValue(int(band_data.get("sat", 0.0) * 100))
+            self.sliders_map[f"{band}_lightness"].setValue(int(band_data.get("lightness", 0.0) * 100))
 
-        # self.sliders_map["grain"].setValue(int(self.preset.get("grain", 0.0) * 100))
-        # self.sliders_map["grain_size"].setValue(int(self.preset.get("grain_size", 1.0) * 10))
+        # film preset
 
-        # TODO: load all film presets to ui
+        # TODO: there's no representation for the color matrix in the ui, so I think it's getting wiped when we write?
+        # TODO: enable bloom checkbox
+        self.chk_bloom.setChecked(self.preset.get('enable_bloom', True))
+        self.sliders_map['bloom_threshold'].setValue(int(self.preset.get('bloom_threshold', 0.0) * 100))
+        self.sliders_map['bloom_radius'].setValue(int(self.preset.get('bloom_radius', 0.0) * 100))
+        self.sliders_map['bloom_strength'].setValue(int(self.preset.get('bloom_strength', 0.0) * 100))
+
+        self.chk_halation.setChecked(self.preset.get('enable_halation', True))
+        self.sliders_map['halation_threshold'].setValue(int(self.preset.get('halation_threshold', 0.0) * 100))
+        self.sliders_map['halation_radius'].setValue(int(self.preset.get('halation_radius', 0.0) * 100))
+        self.sliders_map['halation_strength'].setValue(int(self.preset.get('halation_strength', 0.0) * 100))
+        self.sliders_map['halation_offset_x'].setValue(int(self.preset.get('halation_offset_x', 0.0) * 100))
+        self.sliders_map['halation_offset_y'].setValue(int(self.preset.get('halation_offset_y', 0.0) * 100))
+
+        self.chk_grain.setChecked(self.preset.get('enable_grain', True))
+        self.sliders_map['grain_strength'].setValue(int(self.preset.get('grain_strength', 0.0) * 100))
+        self.sliders_map['grain_size'].setValue(int(self.preset.get('grain_size', 0.0) * 100))
+        self.sliders_map['grain_chroma'].setValue(int(self.preset.get('grain_chroma', 0.0) * 100))
+
+        self.chk_vignette.setChecked(self.preset.get('enable_vignette', True))
+        self.sliders_map['vignette_strength'].setValue(int(self.preset.get('vignette_strength', 0.0) * 100))
+        self.sliders_map['vignette_radius'].setValue(int(self.preset.get('vignette_radius', 0.0) * 100))
+        self.sliders_map['vignette_softness'].setValue(int(self.preset.get('vignette_softness', 0.0) * 100))
+        self.sliders_map['corner_blur_radius'].setValue(int(self.preset.get('corner_blur_radius', 0.0) * 100))
 
         self.is_updating_ui = False
 
@@ -2109,7 +2120,6 @@ class MainWindow(QMainWindow):
             key (str): Key matching requested modification slots.
             value (Any): Payload setting values configuration attributes.
         """
-        # TODO: if the key is part of the crop keys. This is making it more complex
         if key in self.active_crop_data:
             self._update_nested_crop_variant_preset(key, value)
         else:

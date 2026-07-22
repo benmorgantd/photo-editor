@@ -382,16 +382,19 @@ class ColorStage(PipelineStage):
 
             h_matrix = hsv[:, :, 0]
             s_matrix = hsv[:, :, 1]
-            total_h_delta = np.zeros_like(h_matrix)
-            total_s_mod = np.zeros_like(s_matrix)
+
+            total_h_delta = np.zeros_like(h_matrix, dtype=np.float32)
+            total_s_mod = np.zeros_like(s_matrix, dtype=np.float32)
+            total_l_mod = np.zeros_like(h_matrix, dtype=np.float32)
             has_adjustments = False
 
             for band, cfg in bands_config.items():
-                adjustments = color_adj.get(band, {"hue": 0.0, "sat": 0.0})
+                adjustments = color_adj.get(band, {"hue": 0.0, "sat": 0.0, "lightness": 0.0})
                 h_shift = float(adjustments.get('hue', 0.0) * 180.0 * ca_mult)
                 s_shift = float(adjustments.get('sat', 0.0) * ca_mult)
+                l_shift = float(adjustments.get('lightness', 0.0) * ca_mult)
 
-                if h_shift == 0.0 and s_shift == 0.0:
+                if h_shift == 0.0 and s_shift == 0.0 and l_shift == 0.0:
                     continue
                 
                 has_adjustments = True
@@ -404,24 +407,44 @@ class ColorStage(PipelineStage):
                     total_h_delta += (weight * h_shift)
                 if s_shift != 0.0:
                     total_s_mod += (weight * s_shift)
+                if l_shift != 0.0:
+                    total_l_mod += (weight * l_shift)
 
             if has_adjustments:
+                # 1. Apply Hue
                 hsv[:, :, 0] = (hsv[:, :, 0] + total_h_delta) % 360.0
-                pos_mask = (total_s_mod >= 0.0)
-                neg_mask = ~pos_mask
                 
-                s_matrix[pos_mask] = s_matrix[pos_mask] * (1.0 + total_s_mod[pos_mask]) + (total_s_mod[pos_mask] * 0.2)
-                s_matrix[neg_mask] = s_matrix[neg_mask] * (1.0 + total_s_mod[neg_mask])
-                hsv[:, :, 1] = np.clip(s_matrix, 0.0, 1.0)
+                # 2. Apply Saturation
+                s_adjusted = s_matrix.copy()
+                pos_mask_s = (total_s_mod >= 0.0)
+                neg_mask_s = ~pos_mask_s
+                
+                s_adjusted[pos_mask_s] = s_adjusted[pos_mask_s] * (1.0 + total_s_mod[pos_mask_s]) + (total_s_mod[pos_mask_s] * 0.2)
+                s_adjusted[neg_mask_s] = s_adjusted[neg_mask_s] * (1.0 + total_s_mod[neg_mask_s])
+                
+                # Explicitly re-assign to hsv array slice
+                hsv[:, :, 1] = np.clip(s_adjusted, 0.0, 1.0)
 
-                # Convert back to RGB and scale by original HDR luminance ratio!
+                # 3. Convert HSV to RGB
                 new_rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB).astype(np.float32)
-                new_lum = (np.float32(0.2126) * new_rgb[:, :, 0] + 
-                           np.float32(0.7152) * new_rgb[:, :, 1] + 
-                           np.float32(0.0722) * new_rgb[:, :, 2])
-                new_lum_safe = np.maximum(new_lum, np.float32(1e-6))
                 
-                out = new_rgb * np.expand_dims(orig_lum / new_lum_safe, axis=2)
+                # 4. Compute target luminance with lightness shift
+                # Prevent negative luminance multiplier drops below 0.0
+                target_lum = orig_lum * np.maximum(0.0, 1.0 + total_l_mod)
+
+                # 5. Calculate new RGB luminance
+                new_lum = (np.float32(0.2126) * new_rgb[:, :, 0] + 
+                        np.float32(0.7152) * new_rgb[:, :, 1] + 
+                        np.float32(0.0722) * new_rgb[:, :, 2])
+                
+                # Avoid zero-division and limit extreme ratios on dark pixels
+                new_lum_safe = np.maximum(new_lum, np.float32(1e-6))
+                scale_ratio = np.expand_dims(target_lum / new_lum_safe, axis=2)
+                
+                # Prevent extreme luminance amplification on tiny edge values
+                scale_ratio = np.minimum(scale_ratio, np.float32(10.0))
+
+                out = new_rgb * scale_ratio
         
         # 10. Profile RGB Curves (Procedural 1D LUTs)
         # Interpolates channel values rapidly for split-toning effects.
